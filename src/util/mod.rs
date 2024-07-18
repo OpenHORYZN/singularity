@@ -1,68 +1,17 @@
-use std::{ops::Sub, sync::Arc};
+use std::{fmt::Display, ops::Sub};
 
 use nalgebra::Vector3;
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
-use rclrs::{Node, RclrsError, Subscription};
 use thiserror::Error;
-use tokio::sync::watch::{self, Ref};
-
-use rosidl_runtime_rs::Message;
 use tracing::debug;
 
-use crate::geo::MapProjection;
+pub mod geo;
+pub mod pubsub;
 
-pub struct Subscriber<T: Message> {
-    _subscription: Arc<Subscription<T>>,
-    recv: watch::Receiver<T>,
-}
-
-impl<T: Message> Subscriber<T> {
-    pub fn new(node: &Node, topic: &str) -> Result<Self, RclrsError> {
-        let (sender, receiver) = watch::channel(T::default());
-        let _subscription: Arc<Subscription<T>> =
-            node.create_subscription(topic, rclrs::QOS_PROFILE_SENSOR_DATA, move |msg: T| {
-                debug!("Received {msg:?}");
-                let _ = sender.send(msg);
-            })?;
-        Ok(Self {
-            _subscription,
-            recv: receiver,
-        })
-    }
-
-    pub fn subscribe(&self) -> watch::Receiver<T> {
-        self.recv.clone()
-    }
-
-    pub fn current(&self) -> Ref<T> {
-        self.recv.borrow()
-    }
-}
-
-pub struct Publisher<T: Message> {
-    publisher: Arc<rclrs::Publisher<T>>,
-}
-
-impl<T: Message> Publisher<T> {
-    pub fn new(node: &Node, topic: &str) -> Result<Self, RclrsError> {
-        let publisher = node.create_publisher(topic, rclrs::QOS_PROFILE_DEFAULT)?;
-        Ok(Self { publisher })
-    }
-
-    pub fn send(&self, msg: T) {
-        let _ = self.publisher.publish(msg);
-    }
-}
-
-pub trait NodeTimestamp {
-    fn timestamp(&self) -> u64;
-}
-
-impl NodeTimestamp for Node {
-    fn timestamp(&self) -> u64 {
-        self.get_clock().now().nsec as u64 / 1_000
-    }
-}
+pub use self::{
+    geo::MapProjection,
+    pubsub::{NodeTimestamp, Publisher, Subscriber},
+};
 
 pub fn default<T: Default>() -> T {
     T::default()
@@ -90,11 +39,15 @@ impl LocalPosition {
 
         let local_z = current_pos.ref_alt - pos.alt;
 
-        return Ok(Self {
+        let res = Self {
             x: local_x,
             y: local_y,
             z: local_z,
-        });
+        };
+
+        debug!("Projected {} to {}", pos, res);
+
+        return Ok(res);
     }
 
     pub fn expand(self) -> [f32; 3] {
@@ -106,20 +59,16 @@ impl LocalPosition {
     }
 }
 
-impl From<VehicleLocalPosition> for LocalPosition {
-    fn from(value: VehicleLocalPosition) -> Self {
-        Self {
-            x: value.x,
-            y: value.y,
-            z: value.z,
-        }
-    }
-}
-
 impl Sub for LocalPosition {
     type Output = Vector3<f32>;
     fn sub(self, rhs: Self) -> Self::Output {
         Vector3::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+}
+
+impl Display for LocalPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{:.03}, {:.03}, {:.03}]", self.x, self.y, self.z)
     }
 }
 
@@ -137,6 +86,12 @@ impl From<VehicleGlobalPosition> for GlobalPosition {
             lon: value.lon,
             alt: value.alt,
         }
+    }
+}
+
+impl Display for GlobalPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({:.06}, {:.06}, {:.06})", self.lat, self.lon, self.alt)
     }
 }
 
@@ -175,13 +130,37 @@ pub enum PositionConvertError {
     NoGlobalLock,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct TimedWaypoint {
-    pub time: f64,
-    pub position: Vector3<f64>,
+pub fn windows_mut<T, F>(slice: &mut [T], size: usize, mut function: F)
+where
+    F: FnMut(&mut [T]),
+{
+    if slice.len() < size {
+        return;
+    }
+    for start in 0..=(slice.len().saturating_sub(size)) {
+        function(&mut slice[start..][..size]);
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct Waypoint {
-    pub position: Vector3<f64>,
+pub trait LocalPositionLike {
+    fn position(&self) -> LocalPosition;
+    fn acceleration(&self) -> Vector3<f64>;
+    fn velocity(&self) -> Vector3<f64>;
+}
+
+impl LocalPositionLike for VehicleLocalPosition {
+    fn position(&self) -> LocalPosition {
+        LocalPosition {
+            x: self.x,
+            y: self.y,
+            z: self.z,
+        }
+    }
+    fn acceleration(&self) -> Vector3<f64> {
+        Vector3::new(self.ax, self.ay, self.az).cast()
+    }
+
+    fn velocity(&self) -> Vector3<f64> {
+        Vector3::new(self.vx, self.vy, self.vz).cast()
+    }
 }
