@@ -1,20 +1,25 @@
-use anyhow::Context;
+use std::{net::UdpSocket, time::Duration};
+
+use anyhow::anyhow;
+use argus_common::{GlobalPosition, MissionNode, Waypoint};
+use mission::{MissionPlanner, SetpointPair};
 use nalgebra::Vector3;
-use tracing::{debug, info, Level};
+use postcard::from_bytes;
+use tracing::{info, Level};
 
 use px4_msgs::msg::{
     OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleGlobalPosition,
     VehicleLocalPosition, VehicleStatus,
 };
 
-use trajectory::{Constraints3D, TrajectoryController, TrajectorySnapshot, Waypoint};
-
+pub mod mission;
 pub mod trajectory;
 pub mod util;
 pub mod visualize;
 
+use trajectory::Constraints3D;
 use util::{
-    default, GlobalPosition, LocalPosition, LocalPositionLike, NodeTimestamp, Publisher, Subscriber,
+    default, GlobalPositionFeatures, NodeTimestamp, Publisher, Subscriber, VehicleLocalFeatures,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -25,6 +30,8 @@ fn main() -> anyhow::Result<()> {
     let context = rclrs::Context::new(std::env::args())?;
 
     let node = rclrs::Node::new(&context, "republisher")?;
+
+    let udp = UdpSocket::bind("0.0.0.0:4444")?;
 
     info!("Node is starting up ...");
 
@@ -55,25 +62,50 @@ fn main() -> anyhow::Result<()> {
 
     info!("Node initialized");
 
+    let publish_setpoint = |sp: SetpointPair| {
+        pub_offboard.send(sp.0);
+        pub_traj.send(sp.1);
+    };
+
+    let default_constraints = Constraints3D {
+        max_velocity: Vector3::new(4.0, 4.0, 3.0),
+        max_acceleration: Vector3::repeat(0.6),
+        max_jerk: Vector3::repeat(0.4),
+    };
+
+    let mut buf = [0u8; 4000];
+
+    let mission = loop {
+        if let Ok((addr, msg)) = udp
+            .recv_from(&mut buf)
+            .map(|(n, addr)| (addr, &buf[..n]))
+            .map_err(|e| anyhow!("{e}"))
+            .and_then(|(addr, msg)| Ok((addr, from_bytes(msg)?)))
+        {
+            let msg: Vec<MissionNode> = msg;
+            info!("Received mission from {addr}: {msg:?}");
+            break msg;
+        }
+    };
+
+    let _mission = vec![
+        MissionNode::Init,
+        MissionNode::Takeoff { altitude: 7.0 },
+        MissionNode::Waypoint(Waypoint::LocalOffset(Vector3::new(100.0, 10.0, -3.0))),
+        MissionNode::Delay(Duration::from_secs(5)),
+        MissionNode::Waypoint(Waypoint::GlobalRelativeHeight {
+            lat: 47.397971,
+            lon: 8.546164,
+            height_diff: 10.0,
+        }),
+        MissionNode::Land,
+        MissionNode::End,
+    ];
+
     let home_position_global = sub_global_position.current().to_owned();
-    let home_gps: GlobalPosition = home_position_global.into();
+    let home_gps = GlobalPosition::from_vehicle(home_position_global);
 
     info!("Current Position: {}", home_gps);
-
-    let flyoff = GlobalPosition {
-        alt: 7.0,
-        ..home_gps
-    };
-
-    info!("Flyoff: {}", flyoff);
-
-    let target = GlobalPosition {
-        lat: 47.3970,
-        lon: 8.5461,
-        alt: 7.0,
-    };
-
-    info!("Target: {}", target);
 
     info!("Switching to Offboard mode");
 
@@ -85,162 +117,34 @@ fn main() -> anyhow::Result<()> {
         ..default()
     });
 
-    let publish_snapshot = |snapshot: Option<TrajectorySnapshot>| {
-        if let Some(snapshot) = snapshot {
-            let TrajectorySnapshot {
-                position: final_pos,
-                velocity: final_vel,
-                acceleration: final_acc,
-            } = snapshot;
-
-            pub_offboard.send(OffboardControlMode {
-                timestamp: node.timestamp(),
-                position: true,
-                velocity: true,
-                acceleration: true,
-                ..default()
-            });
-
-            let setpoint = TrajectorySetpoint {
-                timestamp: node.timestamp(),
-                position: [final_pos.x as f32, final_pos.y as f32, final_pos.z as f32],
-                velocity: [final_vel.x as f32, final_vel.y as f32, final_vel.z as f32],
-                acceleration: [final_acc.x as f32, final_acc.y as f32, final_acc.z as f32],
-                ..default()
-            };
-
-            debug!("Setpoint {:?}", setpoint);
-            pub_traj.send(setpoint);
-        } else {
-            pub_offboard.send(OffboardControlMode {
-                timestamp: node.timestamp(),
-                velocity: true,
-                ..default()
-            });
-
-            let setpoint = TrajectorySetpoint {
-                timestamp: node.timestamp(),
-                position: [f32::NAN, f32::NAN, f32::NAN],
-                velocity: [0.0, 0.0, 0.0],
-                ..default()
-            };
-            pub_traj.send(setpoint);
-        }
-    };
-
     info!("Waiting for Operator to arm ...");
 
-    while sub_vehicle_status.current().arming_state != VehicleStatus::ARMING_STATE_ARMED {
-        publish_snapshot(None);
-        rclrs::spin_once(node.clone(), None)?;
-    }
-
-    let default_constraints = Constraints3D {
-        max_velocity: Vector3::new(4.0, 4.0, 3.0),
-        max_acceleration: Vector3::repeat(0.6),
-        max_jerk: Vector3::repeat(0.4),
-    };
-
-    let current_position_local = sub_local_position.current().to_owned();
-    let home_local = LocalPosition::project(&home_gps, &current_position_local)?;
-    let flyoff_local = LocalPosition::project(&flyoff, &current_position_local)?;
-    let target_local = LocalPosition::project(&target, &current_position_local)?;
-
-    let initial_na = home_local.to_nalgebra().cast();
-    let flyoff_na = flyoff_local.to_nalgebra().cast();
-    let target_na = target_local.to_nalgebra().cast();
-
-    let waypoints = vec![
-        Waypoint::new(initial_na),
-        Waypoint::new(flyoff_na).with_constraints(Constraints3D {
-            max_acceleration: Vector3::new(0.2, 0.2, 0.2),
-            ..default_constraints
-        }),
-        Waypoint::new(target_na),
-    ];
-
-    let mut traj_to_target =
-        TrajectoryController::new_constrained(waypoints, default_constraints, 1.0)
-            .context("Failed to init Trajectory Controller")?;
-
-    info!(
-        "Trip Duration to Target {:.02}s",
-        traj_to_target.total_duration()
-    );
+    let mut mp = MissionPlanner::init(mission, default_constraints)?;
 
     loop {
         visualize::set_time(node.timestamp() as f64 / 1e6);
         visualize::send_grid();
 
-        let current_position_global = sub_global_position.current().to_owned();
         let current_position_local = sub_local_position.current().to_owned();
+        let current_position_global = sub_global_position.current().to_owned();
 
-        let global: GlobalPosition = current_position_global.into();
-
-        let current_pos = current_position_local.position();
         let current_vel = current_position_local.velocity();
         let current_acc = current_position_local.acceleration();
 
-        let snapshot = traj_to_target.get_corrected_state(
+        let sp = mp.step(
             &node,
-            current_pos.to_nalgebra().cast(),
+            &pub_command,
+            &sub_vehicle_status,
+            current_position_local,
+            current_position_global,
             current_vel,
             current_acc,
-        );
+        )?;
 
-        publish_snapshot(snapshot);
-
-        if (global - target).req(0.00005, 0.3) && current_vel.norm() < 0.3 {
-            break;
+        if let Some(sp) = sp {
+            publish_setpoint(sp);
         }
 
         rclrs::spin_once(node.clone(), None)?;
     }
-
-    info!("Target reached, returning");
-    let waypoints = vec![Waypoint::new(target_na), Waypoint::new(flyoff_na)];
-
-    let mut traj_back = TrajectoryController::new_constrained(waypoints, default_constraints, 1.0)
-        .context("Failed to init Trajectory Controller")?;
-
-    info!("Trip Duration to Home {:.02}s", traj_back.total_duration());
-
-    loop {
-        visualize::set_time(node.timestamp() as f64 / 1e6);
-        visualize::send_grid();
-
-        let current_position_global = sub_global_position.current().to_owned();
-        let current_position_local = sub_local_position.current().to_owned();
-
-        let global: GlobalPosition = current_position_global.into();
-
-        let current_pos = current_position_local.position();
-        let current_vel = current_position_local.velocity();
-        let current_acc = current_position_local.acceleration();
-
-        let snapshot = traj_back.get_corrected_state(
-            &node,
-            current_pos.to_nalgebra().cast(),
-            current_vel,
-            current_acc,
-        );
-
-        publish_snapshot(snapshot);
-
-        if (global - flyoff.into()).req(0.00005, 0.3) && current_vel.norm() < 0.3 {
-            break;
-        }
-
-        rclrs::spin_once(node.clone(), None)?;
-    }
-
-    info!("Finished");
-
-    pub_command.send(VehicleCommand {
-        timestamp: node.timestamp(),
-        command: VehicleCommand::VEHICLE_CMD_NAV_LAND.into(),
-        ..default()
-    });
-
-    Ok(())
 }

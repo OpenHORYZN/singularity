@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 
+use argus_common::LocalPosition;
 use itertools::Itertools;
 use nalgebra::Vector3;
 use s_curve::{
@@ -9,13 +10,13 @@ use s_curve::{
 
 use crate::util::windows_mut;
 
-use super::Waypoint;
+use super::LowLevelWaypoint;
 
 pub fn s_curve_spline(
-    waypoints: Vec<Waypoint>,
+    waypoints: Vec<LowLevelWaypoint>,
     constraints: Constraints3D,
     trans_vel: f64,
-) -> Vec<SCurve3D> {
+) -> Vec<Spline> {
     let mut path = waypoints
         .windows(2)
         .map(|w| {
@@ -34,24 +35,34 @@ pub fn s_curve_spline(
         .collect_vec();
 
     windows_mut(&mut path, 2, |slices| {
-        let trans_vel_v = (slices[1].0.end_pos - slices[1].0.start_pos)
-            .normalize()
-            .component_mul(
-                &(slices[0].0.end_pos - slices[0].0.start_pos)
-                    .normalize()
-                    .abs(),
-            )
-            * trans_vel;
+        let vector_a = slices[0].0.end_pos - slices[0].0.start_pos;
+        let vector_b = slices[1].0.end_pos - slices[1].0.start_pos;
+        let trans_vel_v = ((vector_a.normalize() + vector_b.normalize()) / 2.0) * trans_vel;
         slices[0].0.end_vel = trans_vel_v;
         slices[1].0.start_vel = trans_vel_v;
     });
 
     let spline = path
         .into_iter()
-        .map(|sc| SCurve3D::init(sc.0, sc.1.unwrap_or(constraints)))
+        .map(|sc| {
+            let start_pos = sc.0.start_pos.cast().into();
+            let end_pos = sc.0.end_pos.cast().into();
+            let spline = SCurve3D::init(sc.0, sc.1.unwrap_or(constraints));
+            Spline {
+                start_pos,
+                end_pos,
+                curve: spline,
+            }
+        })
         .collect_vec();
 
     spline
+}
+
+pub struct Spline {
+    pub start_pos: LocalPosition,
+    pub end_pos: LocalPosition,
+    pub curve: SCurve3D,
 }
 
 pub type SCurveFinal = (SCurveParameters, Box<dyn Fn(f64) -> f64>);
@@ -122,6 +133,9 @@ pub struct SCurve3D {
     x: SCurveAllDeriv,
     y: SCurveAllDeriv,
     z: SCurveAllDeriv,
+    x_factor: f64,
+    y_factor: f64,
+    z_factor: f64,
 }
 
 impl SCurve3D {
@@ -143,33 +157,49 @@ impl SCurve3D {
         let y_curve = SCurveAllDeriv::generate(get_constraints(1), get_start_cond(1));
         let z_curve = SCurveAllDeriv::generate(get_constraints(2), get_start_cond(2));
 
-        Self {
+        let result = Self {
             x: x_curve,
             y: y_curve,
             z: z_curve,
+            x_factor: 0.0,
+            y_factor: 0.0,
+            z_factor: 0.0,
+        };
+
+        let total = result.duration();
+
+        let x_factor = result.x.get_duration() / total;
+        let y_factor = result.y.get_duration() / total;
+        let z_factor = result.z.get_duration() / total;
+
+        Self {
+            x_factor,
+            y_factor,
+            z_factor,
+            ..result
         }
     }
 
     pub fn position(&self, t: f64) -> Vector3<f64> {
         Vector3::new(
-            self.x.get_position(t),
-            self.y.get_position(t),
-            self.z.get_position(t),
+            self.x.get_position(t * self.x_factor),
+            self.y.get_position(t * self.y_factor),
+            self.z.get_position(t * self.z_factor),
         )
     }
 
     pub fn velocity(&self, t: f64) -> Vector3<f64> {
         Vector3::new(
-            self.x.get_velocity(t),
-            self.y.get_velocity(t),
-            self.z.get_velocity(t),
+            self.x.get_velocity(t * self.x_factor) * self.x_factor,
+            self.y.get_velocity(t * self.y_factor) * self.y_factor,
+            self.z.get_velocity(t * self.z_factor) * self.z_factor,
         )
     }
     pub fn acceleration(&self, t: f64) -> Vector3<f64> {
         Vector3::new(
-            self.x.get_acceleration(t),
-            self.y.get_acceleration(t),
-            self.z.get_acceleration(t),
+            self.x.get_acceleration(t * self.x_factor) * self.x_factor,
+            self.y.get_acceleration(t * self.y_factor) * self.y_factor,
+            self.z.get_acceleration(t * self.z_factor) * self.z_factor,
         )
     }
 

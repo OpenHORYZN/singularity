@@ -15,8 +15,10 @@ tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 thiserror = "1.0.62"
 anyhow = "1.0.86"
-nalgebra = "0.32.0"
+nalgebra = "0.33.0"
 s_curve = "0.1.7"
 itertools = "0.13.0"
 rerun = { version = "0.17.0", default-features = false, features = ["sdk"] }
 serde = "1.0.204"
+argus_common = { version = "*", path = "../argus_common" }
+postcard = "1.0.8"

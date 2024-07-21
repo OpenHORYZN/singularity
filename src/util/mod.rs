@@ -1,5 +1,6 @@
-use std::{fmt::Display, ops::Sub};
+use std::ops::Sub;
 
+use argus_common::{GlobalPosition, LocalPosition};
 use nalgebra::Vector3;
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
 use thiserror::Error;
@@ -17,15 +18,16 @@ pub fn default<T: Default>() -> T {
     T::default()
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
-pub struct LocalPosition {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+pub trait LocalPositionFeatures {
+    fn project(
+        pos: &GlobalPosition,
+        current_pos: &VehicleLocalPosition,
+    ) -> Result<LocalPosition, PositionConvertError>;
+    fn from_vehicle(vehicle: VehicleLocalPosition) -> LocalPosition;
 }
 
-impl LocalPosition {
-    pub fn project(
+impl LocalPositionFeatures for LocalPosition {
+    fn project(
         pos: &GlobalPosition,
         current_pos: &VehicleLocalPosition,
     ) -> Result<Self, PositionConvertError> {
@@ -49,73 +51,25 @@ impl LocalPosition {
 
         return Ok(res);
     }
-
-    pub fn expand(self) -> [f32; 3] {
-        [self.x, self.y, self.z]
-    }
-
-    pub fn to_nalgebra(self) -> Vector3<f32> {
-        Vector3::new(self.x, self.y, self.z)
-    }
-}
-
-impl Sub for LocalPosition {
-    type Output = Vector3<f32>;
-    fn sub(self, rhs: Self) -> Self::Output {
-        Vector3::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
-    }
-}
-
-impl Display for LocalPosition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{:.03}, {:.03}, {:.03}]", self.x, self.y, self.z)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
-pub struct GlobalPosition {
-    pub lat: f64,
-    pub lon: f64,
-    pub alt: f32,
-}
-
-impl From<VehicleGlobalPosition> for GlobalPosition {
-    fn from(value: VehicleGlobalPosition) -> Self {
+    fn from_vehicle(value: VehicleLocalPosition) -> Self {
         Self {
-            lat: value.lat,
-            lon: value.lon,
-            alt: value.alt,
+            x: value.x,
+            y: value.y,
+            z: value.z,
         }
     }
 }
 
-impl Display for GlobalPosition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({:.06}, {:.06}, {:.06})", self.lat, self.lon, self.alt)
-    }
+pub trait GlobalPositionFeatures {
+    fn from_vehicle(vehicle: VehicleGlobalPosition) -> GlobalPosition;
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
-pub struct GlobalDifference {
-    pub lat: f64,
-    pub lon: f64,
-    pub alt: f32,
-}
-
-impl GlobalDifference {
-    pub fn req(&self, tol_hh: f64, tol_v: f32) -> bool {
-        return self.lat.abs() < tol_hh && self.lon.abs() < tol_hh && self.alt.abs() < tol_v;
-    }
-}
-
-impl Sub for GlobalPosition {
-    type Output = GlobalDifference;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::Output {
-            lat: self.lat - rhs.lat,
-            lon: self.lon - rhs.lon,
-            alt: self.alt - rhs.alt,
+impl GlobalPositionFeatures for GlobalPosition {
+    fn from_vehicle(value: VehicleGlobalPosition) -> GlobalPosition {
+        Self {
+            lat: value.lat,
+            lon: value.lon,
+            alt: value.alt,
         }
     }
 }
@@ -142,13 +96,13 @@ where
     }
 }
 
-pub trait LocalPositionLike {
+pub trait VehicleLocalFeatures {
     fn position(&self) -> LocalPosition;
     fn acceleration(&self) -> Vector3<f64>;
     fn velocity(&self) -> Vector3<f64>;
 }
 
-impl LocalPositionLike for VehicleLocalPosition {
+impl VehicleLocalFeatures for VehicleLocalPosition {
     fn position(&self) -> LocalPosition {
         LocalPosition {
             x: self.x,
@@ -162,5 +116,41 @@ impl LocalPositionLike for VehicleLocalPosition {
 
     fn velocity(&self) -> Vector3<f64> {
         Vector3::new(self.vx, self.vy, self.vz).cast()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct XYZTolerance {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl Default for XYZTolerance {
+    fn default() -> Self {
+        Self {
+            x: 0.5,
+            y: 0.5,
+            z: 0.5,
+        }
+    }
+}
+
+impl XYZTolerance {
+    pub fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+}
+
+pub trait ApproxEq: Sub + Sized {
+    type Tolerance: Default;
+    fn approx_eq(&self, other: &Self, tolerance: Self::Tolerance) -> bool;
+}
+
+impl ApproxEq for LocalPosition {
+    type Tolerance = XYZTolerance;
+    fn approx_eq(&self, other: &Self, tolerance: Self::Tolerance) -> bool {
+        let abs = (*self - *other).abs();
+        abs.x < tolerance.x && abs.y < tolerance.y && abs.z < tolerance.z
     }
 }

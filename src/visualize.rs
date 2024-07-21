@@ -5,7 +5,7 @@ use rerun::{AsComponents, RecordingStream};
 
 pub use rerun::{Color, Position3D};
 
-pub static RERUN: Option<OnceLock<RecordingStream>> = Some(OnceLock::new());
+pub static RERUN: Option<OnceLock<RecordingStream>> = None;
 
 static GRID: OnceLock<Vec<[f32; 3]>> = OnceLock::new();
 
