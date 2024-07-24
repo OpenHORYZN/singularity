@@ -10,7 +10,7 @@ rclrs = "*"
 std_msgs = "*"
 px4_msgs = "*"
 rosidl_runtime_rs = "*"
-tokio = { version = "1.38.0", features = ["sync"] }
+tokio = { version = "1.38.0", features = ["full", "sync"] }
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 thiserror = "1.0.62"
@@ -21,4 +21,16 @@ itertools = "0.13.0"
 rerun = { version = "0.17.0", default-features = false, features = ["sdk"] }
 serde = "1.0.204"
 argus_common = { version = "*", path = "../argus_common" }
-postcard = "1.0.8"
+postcard = { version = "1.0.8", features = ["alloc"] }
+tokio-util = { version = "0.7.11", features = [
+    "codec",
+    "futures-io",
+    "futures-util",
+    "io",
+    "net",
+] }
+futures-util = "0.3.30"
+zenoh = { version = "0.11.0", default-features = false, features = [
+    "transport_tcp",
+    "transport_udp",
+] }

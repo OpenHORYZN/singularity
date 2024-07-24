@@ -3,25 +3,25 @@ use std::{process::exit, time::Duration};
 use anyhow::Context;
 use argus_common::{LocalPosition, MissionNode, Waypoint};
 use itertools::Itertools;
-use nalgebra::Vector3;
 use px4_msgs::msg::{
-    OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleGlobalPosition,
-    VehicleLocalPosition, VehicleStatus,
+    OffboardControlMode, TrajectorySetpoint, VehicleGlobalPosition, VehicleLocalPosition,
+    VehicleStatus,
 };
 use rclrs::Node;
 use solver::build_trajectory;
+use tokio::sync::watch;
 use tracing::{info, trace};
 
 pub type SetpointPair = (OffboardControlMode, TrajectorySetpoint);
 
 use crate::{
+    topics::{PublisherCommand, Publishers, Subscribers},
     trajectory::{
         Constraints3D, TrajectoryController, TrajectoryOutput, TrajectoryProgress,
         TrajectorySnapshot,
     },
     util::{
-        default, ApproxEq, LocalPositionFeatures, NodeTimestamp, Publisher, Subscriber,
-        XYZTolerance,
+        default, ApproxEq, LocalPositionFeatures, NodeTimestamp, VehicleLocalFeatures, XYZTolerance,
     },
 };
 
@@ -87,18 +87,22 @@ impl MissionPlanner {
     pub fn step(
         &mut self,
         node: &Node,
-        pub_command: &Publisher<VehicleCommand>,
-        sub_status: &Subscriber<VehicleStatus>,
-        local_pos: VehicleLocalPosition,
-        global_pos: VehicleGlobalPosition,
-        current_vel: Vector3<f64>,
-        current_acc: Vector3<f64>,
+        subscribers: &Subscribers,
+        publishers: &Publishers,
+        step_pub: &watch::Sender<usize>,
     ) -> Result<Option<SetpointPair>, anyhow::Error> {
+        let local_pos = subscribers.local_position.current();
+        let global_pos = subscribers.global_position.current();
         let local = LocalPosition::from_vehicle(local_pos.to_owned());
+
+        let current_vel = local_pos.velocity();
+        let current_acc = local_pos.acceleration();
 
         let plan_len = self.plan.len();
 
         let mut progress: Option<TrajectoryProgress> = None;
+
+        let _ = step_pub.send(self.current_step);
 
         let current = self
             .plan
@@ -165,11 +169,7 @@ impl MissionPlanner {
                         self.current_step + 1,
                         plan_len,
                     );
-                    pub_command.send(VehicleCommand {
-                        timestamp: node.timestamp(),
-                        command: VehicleCommand::VEHICLE_CMD_NAV_LAND.into(),
-                        ..default()
-                    });
+                    publishers.send_command(&node, PublisherCommand::Land);
                     *initiated = true;
                 }
 
@@ -182,14 +182,20 @@ impl MissionPlanner {
             }
         };
 
-        self.try_advance(node, sub_status, local_pos, global_pos, progress)?;
+        self.try_advance(
+            node,
+            &subscribers.vehicle_status.current(),
+            local_pos.clone(),
+            global_pos.clone(),
+            progress,
+        )?;
         setpoint
     }
 
     fn try_advance(
         &mut self,
         node: &Node,
-        sub_status: &Subscriber<VehicleStatus>,
+        status: &VehicleStatus,
         local_pos: VehicleLocalPosition,
         global_pos: VehicleGlobalPosition,
         progress: Option<TrajectoryProgress>,
@@ -200,7 +206,7 @@ impl MissionPlanner {
             .context("current step invalid")?;
         match current {
             StatefulMissionNode::Init => {
-                if sub_status.current().arming_state == VehicleStatus::ARMING_STATE_ARMED {
+                if status.arming_state == VehicleStatus::ARMING_STATE_ARMED {
                     info!(
                         "[{}/{}] Init: Armed, Starting Trajectory",
                         self.current_step + 1,
@@ -300,9 +306,7 @@ impl MissionPlanner {
             StatefulMissionNode::FindSafeSpot => todo!(),
             StatefulMissionNode::Transition => todo!(),
             StatefulMissionNode::Land { initiated } => {
-                if *initiated
-                    && sub_status.current().arming_state == VehicleStatus::ARMING_STATE_DISARMED
-                {
+                if *initiated && status.arming_state == VehicleStatus::ARMING_STATE_DISARMED {
                     info!(
                         "[{}/{}] (T) Land: Completed",
                         self.current_step + 1,

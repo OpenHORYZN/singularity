@@ -1,29 +1,36 @@
-use std::{net::UdpSocket, time::Duration};
-
-use anyhow::anyhow;
-use argus_common::{GlobalPosition, MissionNode, Waypoint};
-use mission::{MissionPlanner, SetpointPair};
-use nalgebra::Vector3;
-use postcard::from_bytes;
-use tracing::{info, Level};
-
-use px4_msgs::msg::{
-    OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleGlobalPosition,
-    VehicleLocalPosition, VehicleStatus,
+use std::{
+    sync::{mpsc, Arc},
+    time::Duration,
 };
 
+use argus_common::GlobalPosition;
+use futures_util::SinkExt;
+use nalgebra::Vector3;
+use postcard::from_bytes;
+use tokio::{select, sync::watch, task::spawn_blocking};
+use tracing::{error, info, Level};
+use zenoh::prelude::r#async::*;
+
+use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
+
 pub mod mission;
+pub mod topics;
 pub mod trajectory;
 pub mod util;
 pub mod visualize;
 
-use trajectory::Constraints3D;
-use util::{
-    default, GlobalPositionFeatures, NodeTimestamp, Publisher, Subscriber, VehicleLocalFeatures,
+use crate::{
+    mission::{MissionPlanner, SetpointPair},
+    topics::{PublisherCommand, Publishers, Subscribers},
+    trajectory::Constraints3D,
+    util::{GlobalPositionFeatures, NodeTimestamp},
 };
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .init();
 
     visualize::init();
 
@@ -31,120 +38,125 @@ fn main() -> anyhow::Result<()> {
 
     let node = rclrs::Node::new(&context, "republisher")?;
 
-    let udp = UdpSocket::bind("0.0.0.0:4444")?;
-
     info!("Node is starting up ...");
 
-    let sub_global_position: Subscriber<VehicleGlobalPosition> =
-        Subscriber::new(&node, "/fmu/out/vehicle_global_position")?;
+    let subscribers = Subscribers::init(&node)?;
+    let publishers = Publishers::init(&node)?;
 
-    let sub_local_position: Subscriber<VehicleLocalPosition> =
-        Subscriber::new(&node, "/fmu/out/vehicle_local_position")?;
+    let (control_in, control_out) = mpsc::channel();
+    let (ms_in, mut ms_out) = watch::channel(0);
 
-    let sub_vehicle_status: Subscriber<VehicleStatus> =
-        Subscriber::new(&node, "/fmu/out/vehicle_status")?;
+    let subs = subscribers.clone();
+    tokio::spawn(async move {
+        let session = Arc::new(zenoh::open(config::default()).res().await.unwrap());
+        let mut pos_pub = session.declare_publisher("position").res().await.unwrap();
+        let mut ms_pub = session
+            .declare_publisher("mission/step")
+            .res()
+            .await
+            .unwrap();
+        let subscriber = session
+            .declare_subscriber("mission/update")
+            .reliable()
+            .res()
+            .await
+            .unwrap();
 
-    let pub_offboard: Publisher<OffboardControlMode> =
-        Publisher::new(&node, "/fmu/in/offboard_control_mode")?;
+        let pos = subs.global_position.subscribe();
 
-    let pub_traj: Publisher<TrajectorySetpoint> =
-        Publisher::new(&node, "/fmu/in/trajectory_setpoint")?;
+        loop {
+            let mut pos = pos.clone();
+            select! {
+                control = subscriber.recv_async() => {
+                    match control {
+                        Ok(control) => {
+                            match from_bytes(&control.value.payload.contiguous()) {
+                                Ok(plan) => {
+                                    control_in.send(plan).unwrap();
+                                },
+                                Err(e) => {
+                                    error!("Failed to deserialize {e}");
+                                }
+                            }
+                        },
+                        Err(e) => println!("{e}"),
+                    }
+                },
+                Ok(_) = pos.changed() => {
+                    let update = GlobalPosition::from_vehicle(pos.borrow().to_owned());
+                    let data = postcard::to_allocvec(&update).unwrap();
+                    if let Err(e) = pos_pub.send(data).await {
+                        error!("{e}")
+                    }
+                }
+                Ok(_) = ms_out.changed() => {
+                    let step = *ms_out.borrow();
+                    let data = postcard::to_allocvec(&step).unwrap();
+                    if let Err(e) = ms_pub.send(data).await {
+                        error!("{e}")
+                    }
 
-    let pub_command: Publisher<VehicleCommand> = Publisher::new(&node, "/fmu/in/vehicle_command")?;
-
-    info!("Waiting for Position Lock ...");
-
-    while *sub_local_position.current() == VehicleLocalPosition::default()
-        || *sub_global_position.current() == VehicleGlobalPosition::default()
-    {
-        rclrs::spin_once(node.clone(), None)?;
-    }
-
-    info!("Node initialized");
-
-    let publish_setpoint = |sp: SetpointPair| {
-        pub_offboard.send(sp.0);
-        pub_traj.send(sp.1);
-    };
-
-    let default_constraints = Constraints3D {
-        max_velocity: Vector3::new(4.0, 4.0, 3.0),
-        max_acceleration: Vector3::repeat(0.6),
-        max_jerk: Vector3::repeat(0.4),
-    };
-
-    let mut buf = [0u8; 4000];
-
-    let mission = loop {
-        if let Ok((addr, msg)) = udp
-            .recv_from(&mut buf)
-            .map(|(n, addr)| (addr, &buf[..n]))
-            .map_err(|e| anyhow!("{e}"))
-            .and_then(|(addr, msg)| Ok((addr, from_bytes(msg)?)))
-        {
-            let msg: Vec<MissionNode> = msg;
-            info!("Received mission from {addr}: {msg:?}");
-            break msg;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    };
-
-    let _mission = vec![
-        MissionNode::Init,
-        MissionNode::Takeoff { altitude: 7.0 },
-        MissionNode::Waypoint(Waypoint::LocalOffset(Vector3::new(100.0, 10.0, -3.0))),
-        MissionNode::Delay(Duration::from_secs(5)),
-        MissionNode::Waypoint(Waypoint::GlobalRelativeHeight {
-            lat: 47.397971,
-            lon: 8.546164,
-            height_diff: 10.0,
-        }),
-        MissionNode::Land,
-        MissionNode::End,
-    ];
-
-    let home_position_global = sub_global_position.current().to_owned();
-    let home_gps = GlobalPosition::from_vehicle(home_position_global);
-
-    info!("Current Position: {}", home_gps);
-
-    info!("Switching to Offboard mode");
-
-    pub_command.send(VehicleCommand {
-        timestamp: node.timestamp(),
-        param1: 1.0,
-        param2: 6.0,
-        command: VehicleCommand::VEHICLE_CMD_DO_SET_MODE.into(),
-        ..default()
     });
 
-    info!("Waiting for Operator to arm ...");
+    spawn_blocking(move || {
+        info!("Waiting for Position Lock ...");
 
-    let mut mp = MissionPlanner::init(mission, default_constraints)?;
-
-    loop {
-        visualize::set_time(node.timestamp() as f64 / 1e6);
-        visualize::send_grid();
-
-        let current_position_local = sub_local_position.current().to_owned();
-        let current_position_global = sub_global_position.current().to_owned();
-
-        let current_vel = current_position_local.velocity();
-        let current_acc = current_position_local.acceleration();
-
-        let sp = mp.step(
-            &node,
-            &pub_command,
-            &sub_vehicle_status,
-            current_position_local,
-            current_position_global,
-            current_vel,
-            current_acc,
-        )?;
-
-        if let Some(sp) = sp {
-            publish_setpoint(sp);
+        while *subscribers.local_position.current() == VehicleLocalPosition::default()
+            || *subscribers.global_position.current() == VehicleGlobalPosition::default()
+        {
+            rclrs::spin_once(node.clone(), None)?;
         }
 
-        rclrs::spin_once(node.clone(), None)?;
-    }
+        info!("Node initialized");
+
+        let publish_setpoint = |sp: SetpointPair| {
+            publishers.offboard.send(sp.0);
+            publishers.trajectory.send(sp.1);
+        };
+
+        let default_constraints = Constraints3D {
+            max_velocity: Vector3::new(4.0, 4.0, 3.0),
+            max_acceleration: Vector3::repeat(0.6),
+            max_jerk: Vector3::repeat(0.4),
+        };
+
+        let mission = loop {
+            if let Ok(m) = control_out.try_recv() {
+                break m;
+            }
+
+            rclrs::spin_once(node.clone(), None)?;
+        };
+
+        let home_position_global = subscribers.global_position.current().to_owned();
+        let home_gps = GlobalPosition::from_vehicle(home_position_global);
+
+        info!("Current Position: {}", home_gps);
+
+        info!("Switching to Offboard mode");
+
+        publishers.send_command(&node, PublisherCommand::SetModeOffboard);
+
+        info!("Waiting for Operator to arm ...");
+
+        let mut mp = MissionPlanner::init(mission, default_constraints)?;
+
+        loop {
+            visualize::set_time(node.timestamp() as f64 / 1e6);
+            visualize::send_grid();
+
+            let sp = mp.step(&node, &subscribers, &publishers, &ms_in)?;
+
+            if let Some(sp) = sp {
+                publish_setpoint(sp);
+            }
+
+            rclrs::spin_once(node.clone(), None)?;
+        }
+    })
+    .await?
 }
