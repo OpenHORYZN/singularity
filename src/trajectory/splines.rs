@@ -8,7 +8,7 @@ use s_curve::{
     SCurveStartConditions,
 };
 
-use crate::util::windows_mut;
+use crate::util::{finite, windows_mut};
 
 use super::LowLevelWaypoint;
 
@@ -101,15 +101,15 @@ impl SCurveAllDeriv {
     }
 
     pub fn get_velocity(&self, t: f64) -> f64 {
-        self.vel.1(t)
+        finite(self.vel.1(t))
     }
 
     pub fn get_acceleration(&self, t: f64) -> f64 {
-        self.acc.1(t)
+        finite(self.acc.1(t))
     }
 
     pub fn get_duration(&self) -> f64 {
-        self.pos.0.time_intervals.total_duration()
+        finite(self.pos.0.time_intervals.total_duration())
     }
 }
 
@@ -204,9 +204,8 @@ impl SCurve3D {
     }
 
     pub fn duration(&self) -> f64 {
-        let fin = |n: f64| if n.is_finite() { n } else { 0.0 };
-        0f64.max(fin(self.x.get_duration()))
-            .max(fin(self.y.get_duration()))
-            .max(fin(self.z.get_duration()))
+        0f64.max(self.x.get_duration())
+            .max(self.y.get_duration())
+            .max(self.z.get_duration())
     }
 }

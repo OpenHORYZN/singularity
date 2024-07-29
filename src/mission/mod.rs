@@ -1,4 +1,5 @@
-use std::{process::exit, time::Duration};
+use core::f32;
+use std::time::Duration;
 
 use anyhow::Context;
 use argus_common::{LocalPosition, MissionNode, Waypoint};
@@ -10,7 +11,7 @@ use px4_msgs::msg::{
 use rclrs::Node;
 use solver::build_trajectory;
 use tokio::sync::watch;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 pub type SetpointPair = (OffboardControlMode, TrajectorySetpoint);
 
@@ -89,8 +90,8 @@ impl MissionPlanner {
         node: &Node,
         subscribers: &Subscribers,
         publishers: &Publishers,
-        step_pub: &watch::Sender<usize>,
-    ) -> Result<Option<SetpointPair>, anyhow::Error> {
+        step_pub: &watch::Sender<i32>,
+    ) -> Result<MissionSnapshot, anyhow::Error> {
         let local_pos = subscribers.local_position.current();
         let global_pos = subscribers.global_position.current();
         let local = LocalPosition::from_vehicle(local_pos.to_owned());
@@ -102,7 +103,7 @@ impl MissionPlanner {
 
         let mut progress: Option<TrajectoryProgress> = None;
 
-        let _ = step_pub.send(self.current_step);
+        let _ = step_pub.send(self.current_step as i32);
 
         let current = self
             .plan
@@ -110,15 +111,17 @@ impl MissionPlanner {
             .context("current step invalid")?;
 
         let setpoint = match current {
-            StatefulMissionNode::Init => {
-                Ok(Self::generate_setpoint(node, GeneratorInput::VelocityZero))
-            }
-            StatefulMissionNode::Takeoff { .. } | StatefulMissionNode::Waypoint(_) => {
+            StatefulMissionNode::Init => MissionSnapshot::Step {
+                setpoint: Self::generate_setpoint(node, GeneratorInput::VelocityZero),
+            },
+
+            StatefulMissionNode::Waypoint(_) | StatefulMissionNode::Takeoff { .. } => {
                 let controller = self.trajectory.as_mut().context("traj missing")?;
 
                 let TrajectoryOutput {
                     snapshot,
                     progress: prog,
+                    current_target,
                 } = controller.get_corrected_state(
                     node,
                     local.to_nalgebra().cast(),
@@ -128,10 +131,15 @@ impl MissionPlanner {
 
                 progress = Some(prog);
 
-                Ok(Self::generate_setpoint(
-                    node,
-                    GeneratorInput::PosVelAcc(snapshot),
-                ))
+                MissionSnapshot::Step {
+                    setpoint: Self::generate_setpoint(
+                        node,
+                        GeneratorInput::PosVelAcc {
+                            snapshot,
+                            yaw: f32::atan2(current_target.y - local.y, current_target.x - local.x),
+                        },
+                    ),
+                }
             }
             StatefulMissionNode::Delay {
                 start_time,
@@ -155,10 +163,15 @@ impl MissionPlanner {
                     current_acc,
                 );
 
-                Ok(Self::generate_setpoint(
-                    node,
-                    GeneratorInput::PosVelAcc(snapshot),
-                ))
+                MissionSnapshot::Step {
+                    setpoint: Self::generate_setpoint(
+                        node,
+                        GeneratorInput::PosVelAcc {
+                            snapshot,
+                            yaw: f32::NAN,
+                        },
+                    ),
+                }
             }
             StatefulMissionNode::FindSafeSpot => todo!(),
             StatefulMissionNode::Transition => todo!(),
@@ -173,12 +186,14 @@ impl MissionPlanner {
                     *initiated = true;
                 }
 
-                Ok(Self::generate_setpoint(node, GeneratorInput::Nothing))
+                MissionSnapshot::Step {
+                    setpoint: Self::generate_setpoint(node, GeneratorInput::Nothing),
+                }
             }
             StatefulMissionNode::PrecLand => todo!(),
             StatefulMissionNode::End => {
                 info!("[{}/{}] End: Finished", self.current_step + 1, plan_len,);
-                exit(0);
+                MissionSnapshot::Completed
             }
         };
 
@@ -189,7 +204,7 @@ impl MissionPlanner {
             global_pos.clone(),
             progress,
         )?;
-        setpoint
+        Ok(setpoint)
     }
 
     fn try_advance(
@@ -324,7 +339,7 @@ impl MissionPlanner {
 
     pub fn generate_setpoint(node: &Node, input: GeneratorInput) -> Option<SetpointPair> {
         match input {
-            GeneratorInput::PosVelAcc(snapshot) => {
+            GeneratorInput::PosVelAcc { snapshot, yaw } => {
                 let TrajectorySnapshot {
                     position: final_pos,
                     velocity: final_vel,
@@ -344,6 +359,8 @@ impl MissionPlanner {
                     position: [final_pos.x as f32, final_pos.y as f32, final_pos.z as f32],
                     velocity: [final_vel.x as f32, final_vel.y as f32, final_vel.z as f32],
                     acceleration: [final_acc.x as f32, final_acc.y as f32, final_acc.z as f32],
+                    yawspeed: f32::NAN,
+                    yaw: f32::NAN,
                     ..default()
                 };
 
@@ -361,6 +378,8 @@ impl MissionPlanner {
                     timestamp: node.timestamp(),
                     position: [f32::NAN, f32::NAN, f32::NAN],
                     velocity: [0.0, 0.0, 0.0],
+                    yaw: f32::NAN,
+                    yawspeed: f32::NAN,
                     ..default()
                 };
                 Some((offb, setpoint))
@@ -373,5 +392,13 @@ impl MissionPlanner {
 pub enum GeneratorInput {
     Nothing,
     VelocityZero,
-    PosVelAcc(TrajectorySnapshot),
+    PosVelAcc {
+        snapshot: TrajectorySnapshot,
+        yaw: f32,
+    },
+}
+
+pub enum MissionSnapshot {
+    Step { setpoint: Option<SetpointPair> },
+    Completed,
 }

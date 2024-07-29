@@ -5,10 +5,11 @@ use std::{
 
 use argus_common::GlobalPosition;
 use futures_util::SinkExt;
+use mission::MissionSnapshot;
 use nalgebra::Vector3;
 use postcard::from_bytes;
 use tokio::{select, sync::watch, task::spawn_blocking};
-use tracing::{error, info, Level};
+use tracing::{error, info};
 use zenoh::prelude::r#async::*;
 
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
@@ -17,22 +18,19 @@ pub mod mission;
 pub mod topics;
 pub mod trajectory;
 pub mod util;
-pub mod visualize;
 
 use crate::{
     mission::{MissionPlanner, SetpointPair},
     topics::{PublisherCommand, Publishers, Subscribers},
     trajectory::Constraints3D,
-    util::{GlobalPositionFeatures, NodeTimestamp},
+    util::GlobalPositionFeatures,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
+        .with_env_filter("republisher_node=debug")
         .init();
-
-    visualize::init();
 
     let context = rclrs::Context::new(std::env::args())?;
 
@@ -124,38 +122,41 @@ async fn main() -> anyhow::Result<()> {
             max_jerk: Vector3::repeat(0.4),
         };
 
-        let mission = loop {
-            if let Ok(m) = control_out.try_recv() {
-                break m;
-            }
-
-            rclrs::spin_once(node.clone(), None)?;
-        };
-
-        let home_position_global = subscribers.global_position.current().to_owned();
-        let home_gps = GlobalPosition::from_vehicle(home_position_global);
-
-        info!("Current Position: {}", home_gps);
-
-        info!("Switching to Offboard mode");
-
-        publishers.send_command(&node, PublisherCommand::SetModeOffboard);
-
-        info!("Waiting for Operator to arm ...");
-
-        let mut mp = MissionPlanner::init(mission, default_constraints)?;
-
         loop {
-            visualize::set_time(node.timestamp() as f64 / 1e6);
-            visualize::send_grid();
+            let _ = ms_in.send(-1);
+            info!("Waiting for Mission ...");
+            let mission = loop {
+                if let Ok(m) = control_out.try_recv() {
+                    break m;
+                }
 
-            let sp = mp.step(&node, &subscribers, &publishers, &ms_in)?;
+                rclrs::spin_once(node.clone(), None)?;
+            };
 
-            if let Some(sp) = sp {
-                publish_setpoint(sp);
+            let home_position_global = subscribers.global_position.current().to_owned();
+            let home_gps = GlobalPosition::from_vehicle(home_position_global);
+
+            info!("Current Position: {}", home_gps);
+
+            info!("Switching to Offboard mode");
+
+            publishers.send_command(&node, PublisherCommand::SetModeOffboard);
+
+            info!("Waiting for Operator to arm ...");
+
+            let mut mp = MissionPlanner::init(mission, default_constraints)?;
+
+            loop {
+                match mp.step(&node, &subscribers, &publishers, &ms_in)? {
+                    MissionSnapshot::Step { setpoint } => {
+                        if let Some(sp) = setpoint {
+                            publish_setpoint(sp);
+                        }
+                        rclrs::spin_once(node.clone(), None)?;
+                    }
+                    MissionSnapshot::Completed => break,
+                }
             }
-
-            rclrs::spin_once(node.clone(), None)?;
         }
     })
     .await?

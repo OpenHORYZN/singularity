@@ -6,10 +6,7 @@ use rclrs::Node;
 use splines::Spline;
 use tracing::debug;
 
-use crate::{
-    util::NodeTimestamp,
-    visualize::{self, Color},
-};
+use crate::util::NodeTimestamp;
 
 use self::splines::s_curve_spline;
 pub use self::splines::Constraints3D;
@@ -56,13 +53,14 @@ impl TrajectoryController {
     pub fn get_corrected_state(
         &mut self,
         node: &Node,
-        current_pos: Vector3<f64>,
+        _current_pos: Vector3<f64>,
         current_vel: Vector3<f64>,
         current_acc: Vector3<f64>,
     ) -> TrajectoryOutput {
         let TrajectoryOutput {
             snapshot: desired,
             progress,
+            current_target,
         } = self.get_desired_state(node);
 
         let error_velocity = desired.velocity - current_vel;
@@ -71,22 +69,6 @@ impl TrajectoryController {
         let final_vel = (desired.velocity + error_velocity).cast();
         let final_acc = (desired.acceleration + error_accel).cast();
 
-        visualize::log_xyz("trajectory/desired_velocity", desired.velocity);
-        visualize::log_xyz("trajectory/actual_velocity", current_vel);
-        visualize::log_xyz("trajectory/desired_accel", desired.acceleration);
-
-        visualize::log_pos(
-            "trajectory/desired_position",
-            desired.position,
-            Color::from_rgb(215, 116, 222),
-        );
-
-        visualize::log_pos(
-            "trajectory/current_position",
-            current_pos,
-            Color::from_rgb(100, 227, 200),
-        );
-
         TrajectoryOutput {
             snapshot: TrajectorySnapshot {
                 position: desired.position,
@@ -94,6 +76,7 @@ impl TrajectoryController {
                 acceleration: final_acc,
             },
             progress,
+            current_target,
         }
     }
 
@@ -121,6 +104,7 @@ impl TrajectoryController {
                 acceleration: current_curve.acceleration(local_t),
             },
             progress,
+            current_target: current_spline.spline.end_pos,
         }
     }
 
@@ -161,6 +145,7 @@ pub struct TimedSpline {
 pub struct TrajectoryOutput {
     pub snapshot: TrajectorySnapshot,
     pub progress: TrajectoryProgress,
+    pub current_target: LocalPosition,
 }
 
 pub enum TrajectoryProgress {

@@ -114,15 +114,19 @@ pub fn build_trajectory(
                             lat,
                             lon,
                             height_diff,
-                        } => LocalPosition::project(
-                            &GlobalPosition {
-                                lat: *lat,
-                                lon: *lon,
-                                alt: *height_diff as f32 + global_position.alt,
-                            },
-                            &local_position,
-                        )
-                        .unwrap(),
+                        } => {
+                            let mut init = LocalPosition::project(
+                                &GlobalPosition {
+                                    lat: *lat,
+                                    lon: *lon,
+                                    alt: global_position.alt,
+                                },
+                                &local_position,
+                            )
+                            .unwrap();
+                            init.z = (lp.position().z - *height_diff) as f32;
+                            init
+                        }
                     }
                 } else {
                     wp.clone().materialize(&local_position, 0.0)

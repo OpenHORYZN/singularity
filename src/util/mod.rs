@@ -154,3 +154,11 @@ impl ApproxEq for LocalPosition {
         abs.x < tolerance.x && abs.y < tolerance.y && abs.z < tolerance.z
     }
 }
+
+pub fn finite(num: f64) -> f64 {
+    if num.is_finite() {
+        num
+    } else {
+        0.0
+    }
+}
