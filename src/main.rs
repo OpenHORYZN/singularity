@@ -1,26 +1,23 @@
-use std::{
-    sync::{mpsc, Arc},
-    time::Duration,
-};
-
-use argus_common::GlobalPosition;
-use futures_util::SinkExt;
-use mission::MissionSnapshot;
+use anyhow::anyhow;
 use nalgebra::Vector3;
-use postcard::from_bytes;
-use tokio::{select, sync::watch, task::spawn_blocking};
-use tracing::{error, info};
-use zenoh::prelude::r#async::*;
+use rclrs::MandatoryParameter;
+use std::sync::{mpsc, Arc};
+use tokio::{sync::watch, task::spawn_blocking};
+use tracing::info;
 
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
 
+use argus_common::{ControlRequest, ControlResponse, GlobalPosition};
+
+pub mod link;
 pub mod mission;
 pub mod topics;
 pub mod trajectory;
 pub mod util;
 
 use crate::{
-    mission::{MissionPlanner, SetpointPair},
+    link::ArgusLink,
+    mission::{MissionPlanner, MissionSnapshot, SetpointPair},
     topics::{PublisherCommand, Publishers, Subscribers},
     trajectory::Constraints3D,
     util::GlobalPositionFeatures,
@@ -29,76 +26,39 @@ use crate::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("republisher_node=debug")
+        .with_env_filter("singularity=debug")
         .init();
 
     let context = rclrs::Context::new(std::env::args())?;
 
-    let node = rclrs::Node::new(&context, "republisher")?;
+    let node = rclrs::Node::new(&context, "singularity")?;
 
-    info!("Node is starting up ...");
+    let machine: MandatoryParameter<Arc<str>> = node
+        .declare_parameter("machine")
+        .mandatory()
+        .map_err(|e| anyhow!("Argument 'machine' missing: {e:?}"))?;
+
+    let machine = machine.get();
+
+    info!("Singularity v0.1 | Node: {machine}");
 
     let subscribers = Subscribers::init(&node)?;
     let publishers = Publishers::init(&node)?;
 
-    let (control_in, control_out) = mpsc::channel();
-    let (ms_in, mut ms_out) = watch::channel(0);
+    let (mission_in, mission_out) = mpsc::channel();
+    let (step_in, step_out) = watch::channel(0);
 
-    let subs = subscribers.clone();
-    tokio::spawn(async move {
-        let session = Arc::new(zenoh::open(config::default()).res().await.unwrap());
-        let mut pos_pub = session.declare_publisher("position").res().await.unwrap();
-        let mut ms_pub = session
-            .declare_publisher("mission/step")
-            .res()
-            .await
-            .unwrap();
-        let subscriber = session
-            .declare_subscriber("mission/update")
-            .reliable()
-            .res()
-            .await
-            .unwrap();
+    let (control_snd_in, control_snd_out) = tokio::sync::mpsc::channel(16);
+    let (control_rcv_in, control_rcv_out) = mpsc::channel();
 
-        let pos = subs.global_position.subscribe();
-
-        loop {
-            let mut pos = pos.clone();
-            select! {
-                control = subscriber.recv_async() => {
-                    match control {
-                        Ok(control) => {
-                            match from_bytes(&control.value.payload.contiguous()) {
-                                Ok(plan) => {
-                                    control_in.send(plan).unwrap();
-                                },
-                                Err(e) => {
-                                    error!("Failed to deserialize {e}");
-                                }
-                            }
-                        },
-                        Err(e) => println!("{e}"),
-                    }
-                },
-                Ok(_) = pos.changed() => {
-                    let update = GlobalPosition::from_vehicle(pos.borrow().to_owned());
-                    let data = postcard::to_allocvec(&update).unwrap();
-                    if let Err(e) = pos_pub.send(data).await {
-                        error!("{e}")
-                    }
-                }
-                Ok(_) = ms_out.changed() => {
-                    let step = *ms_out.borrow();
-                    let data = postcard::to_allocvec(&step).unwrap();
-                    if let Err(e) = ms_pub.send(data).await {
-                        error!("{e}")
-                    }
-
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    });
+    ArgusLink::init(
+        subscribers.clone(),
+        mission_in,
+        step_out,
+        (control_rcv_in, control_snd_out),
+        machine.to_string(),
+    )
+    .await;
 
     spawn_blocking(move || {
         info!("Waiting for Position Lock ...");
@@ -123,10 +83,10 @@ async fn main() -> anyhow::Result<()> {
         };
 
         loop {
-            let _ = ms_in.send(-1);
+            let _ = step_in.send(-1);
             info!("Waiting for Mission ...");
             let mission = loop {
-                if let Ok(m) = control_out.try_recv() {
+                if let Ok(m) = mission_out.try_recv() {
                     break m;
                 }
 
@@ -144,14 +104,24 @@ async fn main() -> anyhow::Result<()> {
 
             info!("Waiting for Operator to arm ...");
 
-            let mut mp = MissionPlanner::init(mission, default_constraints)?;
+            let mut mp = MissionPlanner::init(mission.to_owned(), default_constraints)?;
 
             loop {
-                match mp.step(&node, &subscribers, &publishers, &ms_in)? {
-                    MissionSnapshot::Step { setpoint } => {
+                match mp.step(&node, &subscribers, &publishers)? {
+                    MissionSnapshot::Step { step, setpoint } => {
                         if let Some(sp) = setpoint {
                             publish_setpoint(sp);
                         }
+                        if let Ok(d) = control_rcv_out.try_recv() {
+                            match d {
+                                ControlRequest::FetchMissionPlan => {
+                                    let _ = control_snd_in.try_send(
+                                        ControlResponse::SendMissionPlan(mission.to_owned()),
+                                    );
+                                }
+                            }
+                        }
+                        let _ = step_in.send(step);
                         rclrs::spin_once(node.clone(), None)?;
                     }
                     MissionSnapshot::Completed => break,

@@ -10,8 +10,7 @@ use px4_msgs::msg::{
 };
 use rclrs::Node;
 use solver::build_trajectory;
-use tokio::sync::watch;
-use tracing::{debug, info, trace};
+use tracing::{info, trace};
 
 pub type SetpointPair = (OffboardControlMode, TrajectorySetpoint);
 
@@ -90,7 +89,6 @@ impl MissionPlanner {
         node: &Node,
         subscribers: &Subscribers,
         publishers: &Publishers,
-        step_pub: &watch::Sender<i32>,
     ) -> Result<MissionSnapshot, anyhow::Error> {
         let local_pos = subscribers.local_position.current();
         let global_pos = subscribers.global_position.current();
@@ -103,7 +101,7 @@ impl MissionPlanner {
 
         let mut progress: Option<TrajectoryProgress> = None;
 
-        let _ = step_pub.send(self.current_step as i32);
+        let current_step = self.current_step as i32;
 
         let current = self
             .plan
@@ -112,6 +110,7 @@ impl MissionPlanner {
 
         let setpoint = match current {
             StatefulMissionNode::Init => MissionSnapshot::Step {
+                step: current_step,
                 setpoint: Self::generate_setpoint(node, GeneratorInput::VelocityZero),
             },
 
@@ -132,6 +131,7 @@ impl MissionPlanner {
                 progress = Some(prog);
 
                 MissionSnapshot::Step {
+                    step: current_step,
                     setpoint: Self::generate_setpoint(
                         node,
                         GeneratorInput::PosVelAcc {
@@ -164,6 +164,7 @@ impl MissionPlanner {
                 );
 
                 MissionSnapshot::Step {
+                    step: current_step,
                     setpoint: Self::generate_setpoint(
                         node,
                         GeneratorInput::PosVelAcc {
@@ -187,6 +188,7 @@ impl MissionPlanner {
                 }
 
                 MissionSnapshot::Step {
+                    step: current_step,
                     setpoint: Self::generate_setpoint(node, GeneratorInput::Nothing),
                 }
             }
@@ -399,6 +401,9 @@ pub enum GeneratorInput {
 }
 
 pub enum MissionSnapshot {
-    Step { setpoint: Option<SetpointPair> },
+    Step {
+        step: i32,
+        setpoint: Option<SetpointPair>,
+    },
     Completed,
 }

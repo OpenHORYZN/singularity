@@ -1910,30 +1910,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
-name = "republisher_node"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argus_common",
- "futures-util",
- "itertools",
- "nalgebra",
- "postcard",
- "px4_msgs",
- "rclrs",
- "rosidl_runtime_rs",
- "s_curve",
- "serde",
- "std_msgs",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "zenoh",
-]
-
-[[package]]
 name = "ring"
 version = "0.16.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2407,6 +2383,30 @@ dependencies = [
  "num-traits",
  "paste",
  "wide",
+]
+
+[[package]]
+name = "singularity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argus_common",
+ "futures-util",
+ "itertools",
+ "nalgebra",
+ "postcard",
+ "px4_msgs",
+ "rclrs",
+ "rosidl_runtime_rs",
+ "s_curve",
+ "serde",
+ "std_msgs",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "zenoh",
 ]
 
 [[package]]
