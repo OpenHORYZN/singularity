@@ -4,12 +4,17 @@ use std::{
     time::Duration,
 };
 
-use argus_common::{ControlRequest, ControlResponse, GlobalPosition, MissionNode};
+use anyhow::anyhow;
 use futures_util::SinkExt;
 use postcard::from_bytes;
 use tokio::{select, sync::watch};
 use tracing::error;
-use zenoh::prelude::r#async::*;
+use zenoh::{
+    config::{AclConfigRules, Action, InterceptorFlow, Permission},
+    prelude::r#async::*,
+};
+
+use argus_common::{ControlRequest, ControlResponse, GlobalPosition, MissionNode};
 
 use crate::{topics::Subscribers, util::GlobalPositionFeatures};
 
@@ -30,7 +35,11 @@ impl ArgusLink {
     ) -> Self {
         tokio::spawn(async move {
             let t = |o: &str| format!("{machine}/{o}");
-            let session = Arc::new(zenoh::open(config::default()).res().await?);
+            let mut config = config::default();
+
+            Self::set_acl(&mut config)?;
+
+            let session = Arc::new(zenoh::open(config).res().await?);
             let mut pos_pub = session.declare_publisher(t("position")).res().await?;
             let mut step_pub = session.declare_publisher(t("mission/step")).res().await?;
             let mut control_pub = session.declare_publisher(t("control/out")).res().await?;
@@ -110,5 +119,33 @@ impl ArgusLink {
             Ok::<_, ZenohError>(())
         });
         ArgusLink
+    }
+
+    fn set_acl(config: &mut Config) -> Result<(), anyhow::Error> {
+        let all_actions = [
+            Action::Put,
+            Action::DeclareSubscriber,
+            Action::Get,
+            Action::DeclareQueryable,
+        ];
+        config
+            .access_control
+            .set_default_permission(Permission::Deny)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        config
+            .access_control
+            .set_rules(Some(vec![AclConfigRules {
+                interfaces: Some(vec!["tailscale0".into()]),
+                actions: all_actions.to_vec(),
+                key_exprs: vec!["**".into()],
+                flows: Some(vec![InterceptorFlow::Ingress, InterceptorFlow::Egress]),
+                permission: Permission::Allow,
+            }]))
+            .map_err(|e| anyhow!("{e:?}"))?;
+        config
+            .access_control
+            .set_enabled(true)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        Ok(())
     }
 }
