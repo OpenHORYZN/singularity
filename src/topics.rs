@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use px4_msgs::msg::{
-    OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleGlobalPosition,
-    VehicleLocalPosition, VehicleStatus,
+    OffboardControlMode, TrajectorySetpoint, VehicleAttitude, VehicleCommand,
+    VehicleGlobalPosition, VehicleLocalPosition, VehicleStatus,
 };
 use rclrs::Node;
 
@@ -12,23 +12,24 @@ pub struct Subscribers {
     pub local_position: Subscriber<VehicleLocalPosition>,
     pub global_position: Subscriber<VehicleGlobalPosition>,
     pub vehicle_status: Subscriber<VehicleStatus>,
+    pub vehicle_attitude: Subscriber<VehicleAttitude>,
 }
 
 impl Subscribers {
     pub fn init(node: &Node) -> anyhow::Result<Arc<Self>> {
-        let global_position: Subscriber<VehicleGlobalPosition> =
-            Subscriber::new(&node, "/fmu/out/vehicle_global_position")?;
+        let global_position = Subscriber::new(&node, "/fmu/out/vehicle_global_position")?;
 
-        let local_position: Subscriber<VehicleLocalPosition> =
-            Subscriber::new(&node, "/fmu/out/vehicle_local_position")?;
+        let local_position = Subscriber::new(&node, "/fmu/out/vehicle_local_position")?;
 
-        let vehicle_status: Subscriber<VehicleStatus> =
-            Subscriber::new(&node, "/fmu/out/vehicle_status")?;
+        let vehicle_status = Subscriber::new(&node, "/fmu/out/vehicle_status")?;
+
+        let vehicle_attitude = Subscriber::new(&node, "/fmu/out/vehicle_attitude")?;
 
         Ok(Arc::new(Self {
             local_position,
             global_position,
             vehicle_status,
+            vehicle_attitude,
         }))
     }
 }

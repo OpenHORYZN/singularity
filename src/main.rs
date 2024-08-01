@@ -26,7 +26,7 @@ use crate::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        //.with_env_filter("singularity=debug")
+        .with_env_filter("singularity=debug")
         .with_max_level(LevelFilter::DEBUG)
         .init();
 
@@ -108,10 +108,17 @@ async fn main() -> anyhow::Result<()> {
             let mut mp = MissionPlanner::init(mission.to_owned(), default_constraints)?;
 
             loop {
-                match mp.step(&node, &subscribers, &publishers)? {
-                    MissionSnapshot::Step { step, setpoint } => {
+                match mp.step(&node, &subscribers)? {
+                    MissionSnapshot::Step {
+                        step,
+                        setpoint,
+                        do_land,
+                    } => {
                         if let Some(sp) = setpoint {
                             publish_setpoint(sp);
+                        }
+                        if do_land {
+                            publishers.send_command(&node, PublisherCommand::Land);
                         }
                         if let Ok(d) = control_rcv_out.try_recv() {
                             match d {

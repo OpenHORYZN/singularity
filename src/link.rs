@@ -1,4 +1,5 @@
 use std::{
+    convert::identity,
     error::Error,
     sync::{mpsc, Arc},
     time::Duration,
@@ -6,17 +7,23 @@ use std::{
 
 use anyhow::anyhow;
 use futures_util::SinkExt;
+use nalgebra::{Quaternion, UnitQuaternion};
 use postcard::from_bytes;
-use tokio::{select, sync::watch};
+use serde::Serialize;
+use tokio::{select, sync::watch, time::sleep};
 use tracing::error;
 use zenoh::{
     config::{AclConfigRules, Action, InterceptorFlow, Permission},
     prelude::r#async::*,
+    publication::Publisher,
 };
 
-use argus_common::{ControlRequest, ControlResponse, GlobalPosition, MissionNode};
+use argus_common::{ControlRequest, ControlResponse, GlobalPosition, LocalPosition, MissionNode};
 
-use crate::{topics::Subscribers, util::GlobalPositionFeatures};
+use crate::{
+    topics::Subscribers,
+    util::{GlobalPositionFeatures, LocalPositionFeatures},
+};
 
 pub type ZenohError = Box<dyn Error + Send + Sync>;
 
@@ -26,7 +33,7 @@ impl ArgusLink {
     pub async fn init(
         subs: Arc<Subscribers>,
         mission_in: mpsc::Sender<Vec<MissionNode>>,
-        mut step_out: watch::Receiver<i32>,
+        step_out: watch::Receiver<i32>,
         mut control_link: (
             mpsc::Sender<ControlRequest>,
             tokio::sync::mpsc::Receiver<ControlResponse>,
@@ -40,8 +47,13 @@ impl ArgusLink {
             Self::set_acl(&mut config)?;
 
             let session = Arc::new(zenoh::open(config).res().await?);
-            let mut pos_pub = session.declare_publisher(t("position")).res().await?;
-            let mut step_pub = session.declare_publisher(t("mission/step")).res().await?;
+            let global_pos_pub = session
+                .declare_publisher(t("global_position"))
+                .res()
+                .await?;
+            let local_pos_pub = session.declare_publisher(t("local_position")).res().await?;
+            let yaw_pub = session.declare_publisher(t("yaw")).res().await?;
+            let step_pub = session.declare_publisher(t("mission/step")).res().await?;
             let mut control_pub = session.declare_publisher(t("control/out")).res().await?;
 
             let mission_sub = session
@@ -56,10 +68,25 @@ impl ArgusLink {
                 .res()
                 .await?;
 
-            let pos = subs.global_position.subscribe();
+            let global_pos = subs.global_position.subscribe();
+            let local_pos = subs.local_position.subscribe();
+            let attitude = subs.vehicle_attitude.subscribe();
+
+            Self::bridge(local_pos, local_pos_pub, |p| LocalPosition::from_vehicle(p));
+            Self::bridge(global_pos, global_pos_pub, |p| {
+                GlobalPosition::from_vehicle(p)
+            });
+
+            Self::bridge(attitude, yaw_pub, |a| {
+                let [w, x, y, z] = a.q;
+                let quat = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+                let (_, _, yaw) = quat.euler_angles();
+                yaw
+            });
+
+            Self::bridge(step_out, step_pub, identity);
 
             loop {
-                let mut pos = pos.clone();
                 select! {
                     mission = mission_sub.recv_async() => {
                         match mission {
@@ -97,28 +124,33 @@ impl ArgusLink {
                             error!("{e}")
                         }
                     }
-                    Ok(_) = pos.changed() => {
-                        let update = GlobalPosition::from_vehicle(pos.borrow().to_owned());
-                        let data = postcard::to_allocvec(&update).unwrap();
-                        if let Err(e) = pos_pub.send(data).await {
-                            error!("{e}")
-                        }
-                    }
-                    Ok(_) = step_out.changed() => {
-                        let step = *step_out.borrow();
-                        let data = postcard::to_allocvec(&step).unwrap();
-                        if let Err(e) = step_pub.send(data).await {
-                            error!("{e}")
-                        }
-
-                    }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(15)).await;
             }
             #[allow(unreachable_code)]
             Ok::<_, ZenohError>(())
         });
         ArgusLink
+    }
+
+    fn bridge<T, U, F>(mut rcv: watch::Receiver<T>, mut publisher: Publisher<'static>, mut map: F)
+    where
+        F: FnMut(T) -> U + Send + 'static,
+        T: ToOwned<Owned = T> + Send + Sync + 'static,
+        U: Serialize + Send + Sync + 'static,
+    {
+        tokio::spawn(async move {
+            loop {
+                if let Ok(_) = rcv.changed().await {
+                    let update = map(rcv.borrow().to_owned());
+                    let data = postcard::to_allocvec(&update).unwrap();
+                    if let Err(e) = publisher.send(data).await {
+                        error!("{e}")
+                    }
+                }
+                sleep(Duration::from_millis(15)).await;
+            }
+        });
     }
 
     fn set_acl(config: &mut Config) -> Result<(), anyhow::Error> {
@@ -135,7 +167,7 @@ impl ArgusLink {
         config
             .access_control
             .set_rules(Some(vec![AclConfigRules {
-                interfaces: Some(vec!["tailscale0".into()]),
+                interfaces: Some(vec!["tailscale0".into(), "lo".into()]),
                 actions: all_actions.to_vec(),
                 key_exprs: vec!["**".into()],
                 flows: Some(vec![InterceptorFlow::Ingress, InterceptorFlow::Egress]),

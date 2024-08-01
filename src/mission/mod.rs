@@ -15,7 +15,7 @@ use tracing::{info, trace};
 pub type SetpointPair = (OffboardControlMode, TrajectorySetpoint);
 
 use crate::{
-    topics::{PublisherCommand, Publishers, Subscribers},
+    topics::Subscribers,
     trajectory::{
         Constraints3D, TrajectoryController, TrajectoryOutput, TrajectoryProgress,
         TrajectorySnapshot,
@@ -88,7 +88,6 @@ impl MissionPlanner {
         &mut self,
         node: &Node,
         subscribers: &Subscribers,
-        publishers: &Publishers,
     ) -> Result<MissionSnapshot, anyhow::Error> {
         let local_pos = subscribers.local_position.current();
         let global_pos = subscribers.global_position.current();
@@ -112,33 +111,68 @@ impl MissionPlanner {
             StatefulMissionNode::Init => MissionSnapshot::Step {
                 step: current_step,
                 setpoint: Self::generate_setpoint(node, GeneratorInput::VelocityZero),
+                do_land: false,
             },
 
-            StatefulMissionNode::Waypoint(_) | StatefulMissionNode::Takeoff { .. } => {
+            StatefulMissionNode::Waypoint(_) => {
                 let controller = self.trajectory.as_mut().context("traj missing")?;
 
                 let TrajectoryOutput {
                     snapshot,
                     progress: prog,
                     current_target,
-                } = controller.get_corrected_state(
-                    node,
-                    local.to_nalgebra().cast(),
-                    current_vel,
-                    current_acc,
-                );
+                } = controller.get_corrected_state(node, current_vel, current_acc);
 
                 progress = Some(prog);
+
+                let delta_x = current_target.x - local.x;
+                let delta_y = current_target.y - local.y;
+
+                let yaw = if (delta_x.powi(2) + delta_y.powi(2)).sqrt() < 0.1 {
+                    f32::NAN
+                } else {
+                    f32::atan2(delta_y, delta_x)
+                };
 
                 MissionSnapshot::Step {
                     step: current_step,
                     setpoint: Self::generate_setpoint(
                         node,
-                        GeneratorInput::PosVelAcc {
-                            snapshot,
-                            yaw: f32::atan2(current_target.y - local.y, current_target.x - local.x),
-                        },
+                        GeneratorInput::PosVelAcc { snapshot, yaw },
                     ),
+                    do_land: false,
+                }
+            }
+            StatefulMissionNode::Takeoff { altitude } => {
+                let controller = self.trajectory.as_mut().context("traj missing")?;
+
+                let TrajectoryOutput {
+                    snapshot,
+                    progress: prog,
+                    current_target,
+                } = controller.get_corrected_state(node, current_vel, current_acc);
+
+                progress = Some(prog);
+
+                let delta_z = (current_target.z - local.z).abs() as f64;
+
+                let yaw = if delta_z >= *altitude / 2.0 {
+                    f32::NAN
+                } else {
+                    if let Some(nt) = controller.get_next_target() {
+                        f32::atan2(nt.y - local.y, nt.x - local.x)
+                    } else {
+                        f32::NAN
+                    }
+                };
+
+                MissionSnapshot::Step {
+                    step: current_step,
+                    setpoint: Self::generate_setpoint(
+                        node,
+                        GeneratorInput::PosVelAcc { snapshot, yaw },
+                    ),
+                    do_land: false,
                 }
             }
             StatefulMissionNode::Delay {
@@ -156,12 +190,8 @@ impl MissionPlanner {
                     *start_time = Some(now);
                 }
                 let controller = self.trajectory.as_mut().context("missing traj")?;
-                let TrajectoryOutput { snapshot, .. } = controller.get_corrected_state(
-                    node,
-                    local.to_nalgebra().cast(),
-                    current_vel,
-                    current_acc,
-                );
+                let TrajectoryOutput { snapshot, .. } =
+                    controller.get_corrected_state(node, current_vel, current_acc);
 
                 MissionSnapshot::Step {
                     step: current_step,
@@ -172,6 +202,7 @@ impl MissionPlanner {
                             yaw: f32::NAN,
                         },
                     ),
+                    do_land: false,
                 }
             }
             StatefulMissionNode::FindSafeSpot => todo!(),
@@ -183,13 +214,18 @@ impl MissionPlanner {
                         self.current_step + 1,
                         plan_len,
                     );
-                    publishers.send_command(&node, PublisherCommand::Land);
                     *initiated = true;
-                }
-
-                MissionSnapshot::Step {
-                    step: current_step,
-                    setpoint: Self::generate_setpoint(node, GeneratorInput::Nothing),
+                    MissionSnapshot::Step {
+                        step: current_step,
+                        setpoint: None,
+                        do_land: true,
+                    }
+                } else {
+                    MissionSnapshot::Step {
+                        step: current_step,
+                        setpoint: None,
+                        do_land: false,
+                    }
                 }
             }
             StatefulMissionNode::PrecLand => todo!(),
@@ -362,7 +398,7 @@ impl MissionPlanner {
                     velocity: [final_vel.x as f32, final_vel.y as f32, final_vel.z as f32],
                     acceleration: [final_acc.x as f32, final_acc.y as f32, final_acc.z as f32],
                     yawspeed: f32::NAN,
-                    yaw: f32::NAN,
+                    yaw,
                     ..default()
                 };
 
@@ -386,13 +422,11 @@ impl MissionPlanner {
                 };
                 Some((offb, setpoint))
             }
-            GeneratorInput::Nothing => None,
         }
     }
 }
 
 pub enum GeneratorInput {
-    Nothing,
     VelocityZero,
     PosVelAcc {
         snapshot: TrajectorySnapshot,
@@ -400,10 +434,12 @@ pub enum GeneratorInput {
     },
 }
 
+#[derive(Debug, Clone)]
 pub enum MissionSnapshot {
     Step {
         step: i32,
         setpoint: Option<SetpointPair>,
+        do_land: bool,
     },
     Completed,
 }

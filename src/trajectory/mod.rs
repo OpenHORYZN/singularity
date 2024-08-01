@@ -53,7 +53,6 @@ impl TrajectoryController {
     pub fn get_corrected_state(
         &mut self,
         node: &Node,
-        _current_pos: Vector3<f64>,
         current_vel: Vector3<f64>,
         current_acc: Vector3<f64>,
     ) -> TrajectoryOutput {
@@ -133,6 +132,10 @@ impl TrajectoryController {
                 to: current_spline.spline.end_pos,
             };
         }
+    }
+
+    pub fn get_next_target(&self) -> Option<LocalPosition> {
+        self.splines.get(self.step + 1).map(|s| s.spline.end_pos)
     }
 }
 
