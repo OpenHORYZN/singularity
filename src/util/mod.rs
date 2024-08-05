@@ -1,4 +1,4 @@
-use std::ops::Sub;
+use std::{fmt::Debug, ops::Sub};
 
 use argus_common::{GlobalPosition, LocalPosition};
 use nalgebra::Vector3;
@@ -74,20 +74,13 @@ impl GlobalPositionFeatures for GlobalPosition {
     }
 }
 
-pub fn vector_3d(vec: Vec<f64>) -> Vector3<f64> {
-    Vector3::new(vec[0], vec[1], vec[2])
-}
-
 #[derive(Debug, Error)]
 pub enum PositionConvertError {
     #[error("No Global XY / Z Lock")]
     NoGlobalLock,
 }
 
-pub fn windows_mut<T, F>(slice: &mut [T], size: usize, mut function: F)
-where
-    F: FnMut(&mut [T]),
-{
+pub fn windows_mut<T>(slice: &mut [T], size: usize, mut function: impl FnMut(&mut [T])) {
     if slice.len() < size {
         return;
     }
@@ -152,6 +145,16 @@ impl ApproxEq for LocalPosition {
     fn approx_eq(&self, other: &Self, tolerance: Self::Tolerance) -> bool {
         let abs = (*self - *other).abs();
         abs.x < tolerance.x && abs.y < tolerance.y && abs.z < tolerance.z
+    }
+}
+
+pub trait MapErr<T> {
+    fn emap(self) -> anyhow::Result<T>;
+}
+
+impl<T, E: Debug> MapErr<T> for Result<T, E> {
+    fn emap(self) -> anyhow::Result<T> {
+        self.map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 }
 

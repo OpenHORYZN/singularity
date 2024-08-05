@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use px4_msgs::msg::{
     OffboardControlMode, TrajectorySetpoint, VehicleAttitude, VehicleCommand,
-    VehicleGlobalPosition, VehicleLocalPosition, VehicleStatus,
+    VehicleGlobalPosition, VehicleLandDetected, VehicleLocalPosition, VehicleStatus,
 };
 use rclrs::Node;
 
@@ -13,6 +13,7 @@ pub struct Subscribers {
     pub global_position: Subscriber<VehicleGlobalPosition>,
     pub vehicle_status: Subscriber<VehicleStatus>,
     pub vehicle_attitude: Subscriber<VehicleAttitude>,
+    pub vehicle_land: Subscriber<VehicleLandDetected>,
 }
 
 impl Subscribers {
@@ -25,11 +26,14 @@ impl Subscribers {
 
         let vehicle_attitude = Subscriber::new(&node, "/fmu/out/vehicle_attitude")?;
 
+        let vehicle_land = Subscriber::new(&node, "/fmu/out/vehicle_land_detected")?;
+
         Ok(Arc::new(Self {
             local_position,
             global_position,
             vehicle_status,
             vehicle_attitude,
+            vehicle_land,
         }))
     }
 }

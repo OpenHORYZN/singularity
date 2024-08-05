@@ -2,9 +2,7 @@
 ///
 /// Formulas according to:
 /// [Wolfram Alpha](http://mathworld.wolfram.com/AzimuthalEquidistantProjection.html)
-#[allow(unused)]
 pub struct MapProjection {
-    ref_lat: f64,
     ref_lon: f64,
     ref_sin_lat: f64,
     ref_cos_lat: f64,
@@ -25,7 +23,6 @@ impl MapProjection {
         let ref_cos_lat = ref_lat.cos();
 
         Self {
-            ref_lat,
             ref_lon,
             ref_sin_lat,
             ref_cos_lat,

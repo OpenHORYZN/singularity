@@ -11,6 +11,7 @@ use crate::util::NodeTimestamp;
 use self::splines::s_curve_spline;
 pub use self::splines::Constraints3D;
 
+pub mod mpc;
 pub mod splines;
 
 pub struct TrajectoryController {

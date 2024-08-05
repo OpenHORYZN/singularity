@@ -145,7 +145,7 @@ pub fn build_trajectory(
         return Ok(None);
     }
 
-    let controller = TrajectoryController::new_constrained(waypoint_stack, constraints, 0.0)
+    let controller = TrajectoryController::new_constrained(waypoint_stack, constraints, 1.0)
         .context("could not create traj c")?;
 
     Ok(Some(controller))

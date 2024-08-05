@@ -5,8 +5,8 @@ use anyhow::Context;
 use argus_common::{LocalPosition, MissionNode, Waypoint};
 use itertools::Itertools;
 use px4_msgs::msg::{
-    OffboardControlMode, TrajectorySetpoint, VehicleGlobalPosition, VehicleLocalPosition,
-    VehicleStatus,
+    OffboardControlMode, TrajectorySetpoint, VehicleGlobalPosition, VehicleLandDetected,
+    VehicleLocalPosition, VehicleStatus,
 };
 use rclrs::Node;
 use solver::build_trajectory;
@@ -189,24 +189,25 @@ impl MissionPlanner {
                     );
                     *start_time = Some(now);
                 }
-                let controller = self.trajectory.as_mut().context("missing traj")?;
-                let TrajectoryOutput { snapshot, .. } =
-                    controller.get_corrected_state(node, current_vel, current_acc);
 
-                MissionSnapshot::Step {
-                    step: current_step,
-                    setpoint: Self::generate_setpoint(
-                        node,
+                let gen_in = match self.trajectory.as_mut() {
+                    Some(controller) => {
+                        let TrajectoryOutput { snapshot, .. } =
+                            controller.get_corrected_state(node, current_vel, current_acc);
                         GeneratorInput::PosVelAcc {
                             snapshot,
                             yaw: f32::NAN,
-                        },
-                    ),
+                        }
+                    }
+                    None => GeneratorInput::VelocityZero,
+                };
+
+                MissionSnapshot::Step {
+                    step: current_step,
+                    setpoint: Self::generate_setpoint(node, gen_in),
                     do_land: false,
                 }
             }
-            StatefulMissionNode::FindSafeSpot => todo!(),
-            StatefulMissionNode::Transition => todo!(),
             StatefulMissionNode::Land { initiated } => {
                 if !*initiated {
                     info!(
@@ -228,6 +229,8 @@ impl MissionPlanner {
                     }
                 }
             }
+            StatefulMissionNode::FindSafeSpot => todo!(),
+            StatefulMissionNode::Transition => todo!(),
             StatefulMissionNode::PrecLand => todo!(),
             StatefulMissionNode::End => {
                 info!("[{}/{}] End: Finished", self.current_step + 1, plan_len,);
@@ -238,6 +241,7 @@ impl MissionPlanner {
         self.try_advance(
             node,
             &subscribers.vehicle_status.current(),
+            &subscribers.vehicle_land.current(),
             local_pos.clone(),
             global_pos.clone(),
             progress,
@@ -249,6 +253,7 @@ impl MissionPlanner {
         &mut self,
         node: &Node,
         status: &VehicleStatus,
+        land: &VehicleLandDetected,
         local_pos: VehicleLocalPosition,
         global_pos: VehicleGlobalPosition,
         progress: Option<TrajectoryProgress>,
@@ -356,10 +361,8 @@ impl MissionPlanner {
                 }
                 return Ok(false);
             }
-            StatefulMissionNode::FindSafeSpot => todo!(),
-            StatefulMissionNode::Transition => todo!(),
             StatefulMissionNode::Land { initiated } => {
-                if *initiated && status.arming_state == VehicleStatus::ARMING_STATE_DISARMED {
+                if *initiated && land.landed {
                     info!(
                         "[{}/{}] (T) Land: Completed",
                         self.current_step + 1,
@@ -368,10 +371,12 @@ impl MissionPlanner {
                     self.current_step += 1;
                     return Ok(true);
                 }
-                return Ok(false);
+                Ok(false)
             }
+            StatefulMissionNode::FindSafeSpot => todo!(),
+            StatefulMissionNode::Transition => todo!(),
             StatefulMissionNode::PrecLand => todo!(),
-            StatefulMissionNode::End => return Ok(true),
+            StatefulMissionNode::End => Ok(true),
         }
     }
 

@@ -29,7 +29,7 @@ use argus_common::{
 
 use crate::{
     topics::Subscribers,
-    util::{GlobalPositionFeatures, LocalPositionFeatures},
+    util::{GlobalPositionFeatures, LocalPositionFeatures, MapErr},
 };
 
 pub type ZenohError = Box<dyn Error + Send + Sync>;
@@ -52,6 +52,13 @@ impl ArgusLink {
             let mut config = config::default();
 
             Self::set_acl(&mut config)?;
+
+            config.listen.endpoints = vec![
+                EndPoint::new("udp", "0.0.0.0:0", "", "iface=tailscale0")?,
+                EndPoint::new("tcp", "0.0.0.0:0", "", "iface=tailscale0")?,
+            ];
+
+            config.transport.unicast.set_max_links(10).emap()?;
 
             let session = Arc::new(zenoh::open(config).res().await?);
 
@@ -125,7 +132,7 @@ impl ArgusLink {
         config
             .access_control
             .set_default_permission(Permission::Deny)
-            .map_err(|e| anyhow!("{e:?}"))?;
+            .emap()?;
         config
             .access_control
             .set_rules(Some(vec![AclConfigRules {
@@ -135,11 +142,8 @@ impl ArgusLink {
                 flows: Some(vec![InterceptorFlow::Ingress, InterceptorFlow::Egress]),
                 permission: Permission::Allow,
             }]))
-            .map_err(|e| anyhow!("{e:?}"))?;
-        config
-            .access_control
-            .set_enabled(true)
-            .map_err(|e| anyhow!("{e:?}"))?;
+            .emap()?;
+        config.access_control.set_enabled(true).emap()?;
         Ok(())
     }
 
