@@ -1,10 +1,7 @@
 use anyhow::anyhow;
 use nalgebra::Vector3;
 use rclrs::MandatoryParameter;
-use std::{
-    process::exit,
-    sync::{mpsc, Arc},
-};
+use std::sync::{mpsc, Arc};
 use tokio::{sync::watch, task::spawn_blocking};
 use tracing::{info, level_filters::LevelFilter};
 
@@ -36,14 +33,6 @@ async fn main() -> anyhow::Result<()> {
     let context = rclrs::Context::new(std::env::args())?;
 
     let node = rclrs::Node::new(&context, "singularity")?;
-
-    let mut slvr = navigation::initialize_solver();
-    let solution =
-        navigation::solve(&[1.0, 5.0, 3.0], &mut slvr, &mut [0f64; 40], &None, &None).unwrap();
-
-    println!("{solution:?}");
-
-    exit(0);
 
     let machine: MandatoryParameter<Arc<str>> = node
         .declare_parameter("machine")

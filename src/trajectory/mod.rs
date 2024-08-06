@@ -1,23 +1,25 @@
+use core::f64;
 use std::fmt::Debug;
 
 use argus_common::LocalPosition;
 use nalgebra::Vector3;
+use optimization_engine::alm::AlmCache;
 use rclrs::Node;
 use splines::Spline;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::util::NodeTimestamp;
 
 use self::splines::s_curve_spline;
 pub use self::splines::Constraints3D;
 
-pub mod mpc;
 pub mod splines;
 
 pub struct TrajectoryController {
     start_time: Option<f64>,
     splines: Vec<TimedSpline>,
     step: usize,
+    cache: AlmCache,
 }
 
 impl TrajectoryController {
@@ -48,12 +50,14 @@ impl TrajectoryController {
             start_time: None,
             splines: timed_splines,
             step: 0,
+            cache: navigation::initialize_solver(),
         })
     }
 
     pub fn get_corrected_state(
         &mut self,
         node: &Node,
+        current_pos: Vector3<f64>,
         current_vel: Vector3<f64>,
         current_acc: Vector3<f64>,
     ) -> TrajectoryOutput {
@@ -61,10 +65,10 @@ impl TrajectoryController {
             snapshot: desired,
             progress,
             current_target,
-        } = self.get_desired_state(node);
+        } = self.get_desired_state(node, &current_pos, &current_vel);
 
-        let error_velocity = desired.velocity - current_vel;
-        let error_accel = desired.acceleration - current_acc;
+        let error_velocity = (desired.velocity - current_vel) * 0.0;
+        let error_accel = (desired.acceleration - current_acc) * 0.0;
 
         let final_vel = (desired.velocity + error_velocity).cast();
         let final_acc = (desired.acceleration + error_accel).cast();
@@ -80,7 +84,12 @@ impl TrajectoryController {
         }
     }
 
-    pub fn get_desired_state(&mut self, node: &Node) -> TrajectoryOutput {
+    pub fn get_desired_state(
+        &mut self,
+        node: &Node,
+        current_pos: &Vector3<f64>,
+        current_vel: &Vector3<f64>,
+    ) -> TrajectoryOutput {
         let now = node.timestamp() as f64 / 1e6;
         let mut just_started = false;
         let start_time = *self.start_time.get_or_insert_with(|| {
@@ -97,14 +106,47 @@ impl TrajectoryController {
 
         let local_t = t - current_spline.start_time;
 
-        TrajectoryOutput {
-            snapshot: TrajectorySnapshot {
-                position: current_curve.position(local_t),
-                velocity: current_curve.velocity(local_t),
-                acceleration: current_curve.acceleration(local_t),
-            },
-            progress,
-            current_target: current_spline.spline.end_pos,
+        let LocalPosition { x, y, z } = current_spline.spline.end_pos;
+
+        let mut u = [0.0; 240];
+        if let Ok(_) = navigation::solve(
+            &[
+                current_pos.x,
+                current_pos.y,
+                current_pos.z,
+                x.into(),
+                y.into(),
+                z.into(),
+                current_vel.x,
+                current_vel.y,
+                current_vel.z,
+            ],
+            &mut self.cache,
+            &mut u,
+            &None,
+            &None,
+        ) {
+            let sl = &u[0..3];
+            info!("{sl:?}");
+            TrajectoryOutput {
+                snapshot: TrajectorySnapshot {
+                    position: Vector3::new(f64::NAN, f64::NAN, f64::NAN),
+                    velocity: Vector3::new(sl[0], sl[1], sl[2]),
+                    acceleration: Vector3::new(f64::NAN, f64::NAN, f64::NAN),
+                },
+                progress,
+                current_target: current_spline.spline.end_pos,
+            }
+        } else {
+            TrajectoryOutput {
+                snapshot: TrajectorySnapshot {
+                    position: current_curve.position(local_t),
+                    velocity: current_curve.velocity(local_t),
+                    acceleration: current_curve.acceleration(local_t),
+                },
+                progress,
+                current_target: current_spline.spline.end_pos,
+            }
         }
     }
 

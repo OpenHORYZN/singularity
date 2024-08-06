@@ -121,7 +121,12 @@ impl MissionPlanner {
                     snapshot,
                     progress: prog,
                     current_target,
-                } = controller.get_corrected_state(node, current_vel, current_acc);
+                } = controller.get_corrected_state(
+                    node,
+                    local.to_nalgebra().cast(),
+                    current_vel,
+                    current_acc,
+                );
 
                 progress = Some(prog);
 
@@ -150,7 +155,12 @@ impl MissionPlanner {
                     snapshot,
                     progress: prog,
                     current_target,
-                } = controller.get_corrected_state(node, current_vel, current_acc);
+                } = controller.get_corrected_state(
+                    node,
+                    local.to_nalgebra().cast(),
+                    current_vel,
+                    current_acc,
+                );
 
                 progress = Some(prog);
 
@@ -192,8 +202,12 @@ impl MissionPlanner {
 
                 let gen_in = match self.trajectory.as_mut() {
                     Some(controller) => {
-                        let TrajectoryOutput { snapshot, .. } =
-                            controller.get_corrected_state(node, current_vel, current_acc);
+                        let TrajectoryOutput { snapshot, .. } = controller.get_corrected_state(
+                            node,
+                            local.to_nalgebra().cast(),
+                            current_vel,
+                            current_acc,
+                        );
                         GeneratorInput::PosVelAcc {
                             snapshot,
                             yaw: f32::NAN,
@@ -391,9 +405,9 @@ impl MissionPlanner {
 
                 let offb = OffboardControlMode {
                     timestamp: node.timestamp(),
-                    position: true,
+                    position: false,
                     velocity: true,
-                    acceleration: true,
+                    acceleration: false,
                     ..default()
                 };
 
