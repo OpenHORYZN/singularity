@@ -85,8 +85,8 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let default_constraints = Constraints3D {
-            max_velocity: Vector3::new(4.0, 4.0, 3.0),
-            max_acceleration: Vector3::repeat(0.3),
+            max_velocity: Vector3::new(6.0, 6.0, 6.0),
+            max_acceleration: Vector3::repeat(0.4),
             max_jerk: Vector3::repeat(0.4),
         };
 
