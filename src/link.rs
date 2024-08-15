@@ -8,10 +8,9 @@ use std::{
 
 use anyhow::{anyhow, bail};
 use futures_util::SinkExt;
-use nalgebra::{Quaternion, UnitQuaternion};
 use postcard::from_bytes;
 use tokio::{select, sync::watch, time::sleep};
-use tracing::error;
+use tracing::{error, info};
 use zenoh::{
     config::{AclConfigRules, Action, InterceptorFlow, Permission},
     prelude::r#async::*,
@@ -24,12 +23,12 @@ use argus_common::{
         IControlRequest, IControlResponse, IGlobalPosition, ILocalPosition, IMissionStep,
         IMissionUpdate, IYaw, Interface,
     },
-    ControlRequest, ControlResponse, GlobalPosition, LocalPosition, MissionNode,
+    ControlRequest, ControlResponse, GlobalPosition, LocalPosition, MissionPlan,
 };
 
 use crate::{
     topics::Subscribers,
-    util::{GlobalPositionFeatures, LocalPositionFeatures, MapErr},
+    util::{attitude_to_yaw, GlobalPositionFeatures, LocalPositionFeatures, MapErr},
 };
 
 pub type ZenohError = Box<dyn Error + Send + Sync>;
@@ -39,7 +38,7 @@ pub struct ArgusLink;
 impl ArgusLink {
     pub async fn init(
         subs: Arc<Subscribers>,
-        mission_in: mpsc::Sender<Vec<MissionNode>>,
+        mission_in: mpsc::Sender<MissionPlan>,
         step_out: watch::Receiver<i32>,
         mut control_link: (
             mpsc::Sender<ControlRequest>,
@@ -53,14 +52,22 @@ impl ArgusLink {
 
             Self::set_acl(&mut config)?;
 
+            let interface = "tailscale0";
+
             config.listen.endpoints = vec![
-                EndPoint::new("udp", "0.0.0.0:0", "", "iface=tailscale0")?,
-                EndPoint::new("tcp", "0.0.0.0:0", "", "iface=tailscale0")?,
+                EndPoint::new("udp", "0.0.0.0:0", "", format!("iface={interface}"))?,
+                EndPoint::new("tcp", "0.0.0.0:0", "", format!("iface={interface}"))?,
             ];
 
             config.transport.unicast.set_max_links(10).emap()?;
 
             let session = Arc::new(zenoh::open(config).res().await?);
+
+            let zid = session.zid();
+
+            info!(
+                "GCS Link: Enabled on interface {interface}, Access Control: Yes, Identity {zid}"
+            );
 
             let global_pos_pub: Pub<IGlobalPosition> = session.publisher(&m).await?;
             let local_pos_pub: Pub<ILocalPosition> = session.publisher(&m).await?;
@@ -80,12 +87,7 @@ impl ArgusLink {
                 GlobalPosition::from_vehicle(p)
             });
 
-            Self::bridge(attitude, yaw_pub, |a| {
-                let [w, x, y, z] = a.q;
-                let quat = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
-                let (_, _, yaw) = quat.euler_angles();
-                yaw
-            });
+            Self::bridge(attitude, yaw_pub, |a| attitude_to_yaw(&a));
 
             Self::bridge(step_out, step_pub, identity);
 

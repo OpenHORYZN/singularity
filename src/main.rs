@@ -3,11 +3,12 @@ use nalgebra::Vector3;
 use rclrs::MandatoryParameter;
 use std::sync::{mpsc, Arc};
 use tokio::{sync::watch, task::spawn_blocking};
-use tracing::{info, level_filters::LevelFilter};
+use tracing::info;
+use util::LocalPositionFeatures;
 
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
 
-use argus_common::{ControlRequest, ControlResponse, GlobalPosition};
+use argus_common::{ControlRequest, ControlResponse, GlobalPosition, LocalPosition};
 
 pub mod link;
 pub mod mission;
@@ -27,7 +28,6 @@ use crate::{
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("singularity=debug")
-        .with_max_level(LevelFilter::DEBUG)
         .init();
 
     let context = rclrs::Context::new(std::env::args())?;
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     spawn_blocking(move || {
-        info!("Waiting for Position Lock ...");
+        info!("Waiting for Connection to PX4 ...");
 
         while *subscribers.local_position.current() == VehicleLocalPosition::default()
             || *subscribers.global_position.current() == VehicleGlobalPosition::default()
@@ -70,7 +70,14 @@ async fn main() -> anyhow::Result<()> {
             rclrs::spin_once(node.clone(), None)?;
         }
 
-        info!("Node initialized");
+        let initial_local =
+            LocalPosition::from_vehicle(subscribers.local_position.current().to_owned());
+
+        let initial_global =
+            GlobalPosition::from_vehicle(subscribers.global_position.current().to_owned());
+
+        info!("Received initial Position Frame: {initial_local} {initial_global}");
+        info!("Node initialized, Ready for GCS connection");
 
         let publish_setpoint = |sp: SetpointPair| {
             publishers.offboard.send(sp.0);
@@ -79,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
 
         let default_constraints = Constraints3D {
             max_velocity: Vector3::new(4.0, 4.0, 3.0),
-            max_acceleration: Vector3::repeat(0.6),
+            max_acceleration: Vector3::repeat(0.3),
             max_jerk: Vector3::repeat(0.4),
         };
 
@@ -88,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
             info!("Waiting for Mission ...");
             let mission = loop {
                 if let Ok(m) = mission_out.try_recv() {
-                    info!("Received Mission: {m:?}");
+                    info!("Received Mission: {m}");
                     break m;
                 }
 
@@ -109,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
             let mut mp = MissionPlanner::init(mission.to_owned(), default_constraints)?;
 
             loop {
-                match mp.step(&node, &subscribers)? {
+                match mp.poll(&node, &subscribers)? {
                     MissionSnapshot::Step {
                         step,
                         setpoint,
@@ -127,6 +134,11 @@ async fn main() -> anyhow::Result<()> {
                                     let _ = control_snd_in.try_send(
                                         ControlResponse::SendMissionPlan(mission.to_owned()),
                                     );
+                                }
+                                ControlRequest::PauseResume(pause) => {
+                                    mp.pause_resume(pause, &node);
+                                    let _ = control_snd_in
+                                        .try_send(ControlResponse::PauseResume(pause));
                                 }
                             }
                         }

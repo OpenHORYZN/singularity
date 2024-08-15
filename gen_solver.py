@@ -3,12 +3,12 @@ import casadi.casadi as cs
 
 # Nonconvex MPC for trajectory following
 
-(nu, nx, N, ts) = (3, 3, 80, 0.1)
+(nu, nx, N, ts) = (3, 3, 10, 1)
 
 # q = Gain stepwise position deviation cost
 # r = Gain acceleration cost
 # qN = Gain terminal position deviation cost
-(q, r, qN) = (5, 1, 1)
+(q, r, qN) = (0, 1, 1)
 
 u = cs.SX.sym('u', nu*N)
 z0 = cs.SX.sym('z0', nx + nx + nx)
@@ -18,8 +18,6 @@ z0 = cs.SX.sym('z0', nx + nx + nx)
 cost = 0
 # LCI = last control input
 lci = [v0x, v0y, v0z]
-# Constraints for acceleration
-f1_accel = []
 
 for t in range(0, nu*N, nu):
     cost += q*((x-xref)**2 + (y-yref)**2 + (z-zref)**2)
@@ -27,7 +25,6 @@ for t in range(0, nu*N, nu):
     dx = u_t[0]-lci[0]
     dy = u_t[1]-lci[1]
     dz = u_t[2]-lci[2]
-    f1_accel = cs.vertcat(f1_accel, dx, dy, dz)
     cost += r * (dx**2 + dy**2 + dz**2)
     x += ts * u_t[0] 
     y += ts * u_t[1]
@@ -40,11 +37,11 @@ for t in range(0, nu*N, nu):
 u0 = u[0:3]
 cost += qN*((x-xref)**2 + (y-yref)**2 + (z-zref)**2)
 
-f1 = cs.vertcat(u0[0] - v0x, u0[1] - v0y, u0[2] - v0z, f1_accel)
+f1 = cs.vertcat(u0[0] - v0x, u0[1] - v0y, u0[2] - v0z)
 
 to_zero = og.constraints.Zero()
-max_accel = og.constraints.BallInf(None, 0.2)
-set_c = og.constraints.CartesianProduct([2, nu*N + 2], [to_zero, max_accel])
+max_accel = og.constraints.BallInf(None, 0.4)
+# set_c = og.constraints.CartesianProduct([2, nu*N + 2], [to_zero, max_accel])
 
 umin = [-2.0] * (nu*N)
 umax = [2.0] * (nu*N)
@@ -52,7 +49,7 @@ bounds = og.constraints.Rectangle(umin, umax)
 
 problem = og.builder.Problem(u, z0, cost) \
     .with_constraints(bounds) \
-    .with_aug_lagrangian_constraints(f1, set_c)
+    .with_aug_lagrangian_constraints(f1, to_zero)
 
 build_config = og.config.BuildConfiguration()\
     .with_build_directory("solver")\
@@ -69,4 +66,3 @@ builder = og.builder.OpEnOptimizerBuilder(problem,
                                           build_config,
                                           solver_config)
 builder.build()
-

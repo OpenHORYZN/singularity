@@ -1,8 +1,8 @@
 use std::{fmt::Debug, ops::Sub};
 
-use argus_common::{GlobalPosition, LocalPosition};
-use nalgebra::Vector3;
-use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
+use argus_common::{GlobalPosition, LocalPosition, Waypoint};
+use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+use px4_msgs::msg::{VehicleAttitude, VehicleGlobalPosition, VehicleLocalPosition};
 use thiserror::Error;
 use tracing::debug;
 
@@ -16,6 +16,57 @@ pub use self::{
 
 pub fn default<T: Default>() -> T {
     T::default()
+}
+
+pub trait Materialize {
+    fn materialize(
+        &self,
+        local_position: &VehicleLocalPosition,
+        global_height: f64,
+    ) -> LocalPosition;
+}
+
+impl Materialize for Waypoint {
+    fn materialize(
+        &self,
+        local_position: &VehicleLocalPosition,
+        global_height: f64,
+    ) -> LocalPosition {
+        match *self {
+            Waypoint::LocalOffset(o) => {
+                let current = local_position.position();
+                let offset: Vector3<f32> = o.cast();
+                let offset: LocalPosition = offset.into();
+                return offset + current;
+            }
+            Waypoint::GlobalFixedHeight {
+                lat,
+                lon,
+                alt: height_amsl,
+            } => LocalPosition::project(
+                &GlobalPosition {
+                    lat,
+                    lon,
+                    alt: height_amsl as f32,
+                },
+                &local_position,
+            )
+            .unwrap(),
+            Waypoint::GlobalRelativeHeight {
+                lat,
+                lon,
+                height_diff,
+            } => LocalPosition::project(
+                &GlobalPosition {
+                    lat,
+                    lon,
+                    alt: (global_height + height_diff) as f32,
+                },
+                &local_position,
+            )
+            .unwrap(),
+        }
+    }
 }
 
 pub trait LocalPositionFeatures {
@@ -148,6 +199,14 @@ impl ApproxEq for LocalPosition {
     }
 }
 
+impl ApproxEq for f64 {
+    type Tolerance = f64;
+
+    fn approx_eq(&self, other: &Self, tolerance: Self::Tolerance) -> bool {
+        (self - other).abs() < tolerance
+    }
+}
+
 pub trait MapErr<T> {
     fn emap(self) -> anyhow::Result<T>;
 }
@@ -164,4 +223,11 @@ pub fn finite(num: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+pub fn attitude_to_yaw(attitude: &VehicleAttitude) -> f32 {
+    let [w, x, y, z] = attitude.q;
+    let quat = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+    let (_, _, yaw) = quat.euler_angles();
+    yaw
 }

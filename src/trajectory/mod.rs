@@ -1,211 +1,284 @@
 use core::f64;
-use std::fmt::Debug;
+use std::{collections::HashSet, fmt::Debug};
 
-use argus_common::LocalPosition;
+use anyhow::Context;
+use argus_common::{GlobalPosition, LocalPosition, Waypoint};
 use nalgebra::Vector3;
-use optimization_engine::alm::AlmCache;
+use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
 use rclrs::Node;
-use splines::Spline;
-use tracing::{debug, info};
+use tracing::{debug, error};
 
-use crate::util::NodeTimestamp;
+use crate::{
+    mission::{StatefulMissionItem, StatefulMissionPlan},
+    trajectory::simulator::{SimulatorOutput, SimulatorStatus, TrajectorySimulator},
+    util::{ApproxEq, LocalPositionFeatures, Materialize, VehicleLocalFeatures},
+};
 
-use self::splines::s_curve_spline;
-pub use self::splines::Constraints3D;
+pub use crate::trajectory::splines::Constraints3D;
 
+pub mod simulator;
 pub mod splines;
 
 pub struct TrajectoryController {
-    start_time: Option<f64>,
-    splines: Vec<TimedSpline>,
+    sim: Option<TrajectorySimulator>,
+    completions: HashSet<usize>,
+    waypoints: Vec<LowLevelWaypoint>,
     step: usize,
-    cache: AlmCache,
+    manual_pause: bool,
 }
 
 impl TrajectoryController {
-    pub fn new_constrained(
-        waypoints: Vec<LowLevelWaypoint>,
-        constraints: Constraints3D,
-        trans_vel: f64,
-    ) -> Option<Self> {
-        let splines = s_curve_spline(waypoints.clone(), constraints, trans_vel);
-
-        let mut timed_splines = vec![];
-        let mut acc = 0.0;
-
-        for spline in splines {
-            let duration = spline.curve.duration();
-            debug!("Curve Duration {:.04}s", duration);
-            timed_splines.push(TimedSpline {
-                spline,
-                start_time: acc,
-                end_time: acc + duration,
-            });
-            acc += duration;
-        }
-
-        debug!("Total Duration {:.04}s", acc);
-
-        Some(Self {
-            start_time: None,
-            splines: timed_splines,
+    pub fn new() -> Self {
+        Self {
+            sim: None,
+            completions: HashSet::new(),
+            waypoints: vec![],
             step: 0,
-            cache: navigation::initialize_solver(),
-        })
+            manual_pause: false,
+        }
     }
 
-    pub fn get_corrected_state(
+    pub fn poll(
         &mut self,
         node: &Node,
-        current_pos: Vector3<f64>,
-        current_vel: Vector3<f64>,
-        current_acc: Vector3<f64>,
-    ) -> TrajectoryOutput {
-        let TrajectoryOutput {
-            snapshot: desired,
-            progress,
-            current_target,
-        } = self.get_desired_state(node, &current_pos, &current_vel);
+        current_state: StateSnapshot,
+        current_yaw: f64,
+    ) -> Option<TrajectoryPoll> {
+        let sim = self.sim.as_mut()?;
 
-        let error_velocity = (desired.velocity - current_vel) * 0.0;
-        let error_accel = (desired.acceleration - current_acc) * 0.0;
+        let SimulatorOutput {
+            snapshot: desired,
+            status,
+        } = sim.get_state(node);
+
+        let status = match status {
+            SimulatorStatus::Passed(id) => {
+                sim.pause(node);
+                debug!("Waiting until Yaw is headed to next Waypoint ...");
+                self.step += 1;
+                if self.completions.contains(&id) {
+                    WaypointStatus::Progress
+                } else {
+                    WaypointStatus::NoProgress
+                }
+            }
+            SimulatorStatus::Clamped(id) => {
+                if self.step + 1 < self.waypoints.len() {
+                    self.step += 1;
+                }
+                if self.completions.contains(&id) {
+                    WaypointStatus::Finish
+                } else {
+                    WaypointStatus::NoProgress
+                }
+            }
+            SimulatorStatus::Started => {
+                self.step += 1;
+                WaypointStatus::NoProgress
+            }
+            _ => WaypointStatus::NoProgress,
+        };
+
+        if sim.is_paused() {
+            let Some(tgt) = self.waypoints.get(self.step) else {
+                error!("paused but no next target?");
+                return None;
+            };
+
+            let tgt = tgt.position();
+
+            let delta_x = tgt.x - current_state.position.x;
+            let delta_y = tgt.y - current_state.position.y;
+
+            let desired_yaw = f64::atan2(delta_y, delta_x);
+
+            if current_yaw.approx_eq(&desired_yaw, 0.001) && !self.manual_pause {
+                debug!("Yaw rotation complete, resuming");
+                sim.resume();
+            }
+        }
+
+        let error_velocity = desired.velocity - current_state.velocity;
+        let error_accel = desired.acceleration - current_state.acceleration;
 
         let final_vel = (desired.velocity + error_velocity).cast();
         let final_acc = (desired.acceleration + error_accel).cast();
 
-        TrajectoryOutput {
-            snapshot: TrajectorySnapshot {
+        Some(TrajectoryPoll {
+            snapshot: StateSnapshot {
                 position: desired.position,
                 velocity: final_vel,
                 acceleration: final_acc,
             },
-            progress,
-            current_target,
-        }
+            status,
+            current_target: self.waypoints[self.step].clone(),
+        })
     }
 
-    pub fn get_desired_state(
+    pub fn build(
         &mut self,
-        node: &Node,
-        current_pos: &Vector3<f64>,
-        current_vel: &Vector3<f64>,
-    ) -> TrajectoryOutput {
-        let now = node.timestamp() as f64 / 1e6;
-        let mut just_started = false;
-        let start_time = *self.start_time.get_or_insert_with(|| {
-            just_started = true;
-            now
-        });
+        local_position: VehicleLocalPosition,
+        global_position: VehicleGlobalPosition,
+        current_step: usize,
+        plan: &StatefulMissionPlan,
+        include_current_pos: bool,
+        constraints: Constraints3D,
+    ) -> anyhow::Result<()> {
+        let forward = plan
+            .nodes
+            .get(current_step..)
+            .context("out of bounds")?
+            .iter()
+            .map(|i| &i.item);
 
-        let t = now - start_time;
+        let mut waypoint_stack = vec![];
 
-        let progress = self.progress(t, just_started);
+        let mut id = 0;
 
-        let current_spline = &self.splines[self.step];
-        let current_curve = &current_spline.spline.curve;
+        self.completions.clear();
+        self.step = 0;
 
-        let local_t = t - current_spline.start_time;
-
-        let LocalPosition { x, y, z } = current_spline.spline.end_pos;
-
-        let mut u = [0.0; 240];
-        if let Ok(_) = navigation::solve(
-            &[
-                current_pos.x,
-                current_pos.y,
-                current_pos.z,
-                x.into(),
-                y.into(),
-                z.into(),
-                current_vel.x,
-                current_vel.y,
-                current_vel.z,
-            ],
-            &mut self.cache,
-            &mut u,
-            &None,
-            &None,
-        ) {
-            let sl = &u[0..3];
-            info!("{sl:?}");
-            TrajectoryOutput {
-                snapshot: TrajectorySnapshot {
-                    position: Vector3::new(f64::NAN, f64::NAN, f64::NAN),
-                    velocity: Vector3::new(sl[0], sl[1], sl[2]),
-                    acceleration: Vector3::new(f64::NAN, f64::NAN, f64::NAN),
-                },
-                progress,
-                current_target: current_spline.spline.end_pos,
-            }
-        } else {
-            TrajectoryOutput {
-                snapshot: TrajectorySnapshot {
-                    position: current_curve.position(local_t),
-                    velocity: current_curve.velocity(local_t),
-                    acceleration: current_curve.acceleration(local_t),
-                },
-                progress,
-                current_target: current_spline.spline.end_pos,
-            }
-        }
-    }
-
-    pub fn total_duration(&self) -> f64 {
-        self.splines.last().map(|s| s.end_time).unwrap_or_default()
-    }
-
-    fn progress(&mut self, t: f64, just_started: bool) -> TrajectoryProgress {
-        let current_spline = &self.splines[self.step];
-
-        if just_started {
-            return TrajectoryProgress::Started(current_spline.spline.start_pos);
+        if include_current_pos {
+            waypoint_stack.push(LowLevelWaypoint::new(id, local_position.position()));
+            id += 1;
         }
 
-        if t > current_spline.end_time {
-            let next_step = self.step + 1;
-            if next_step < self.splines.len() {
-                self.step = next_step;
-                return TrajectoryProgress::Passed(current_spline.spline.end_pos);
-            } else {
-                return TrajectoryProgress::Clamped(current_spline.spline.end_pos);
-            }
-        } else {
-            return TrajectoryProgress::InTransit {
-                from: current_spline.spline.start_pos,
-                to: current_spline.spline.end_pos,
+        for node in forward {
+            let last_wp = waypoint_stack.last().cloned();
+            let mut push_wp = |pos, constr| {
+                let now_id = id;
+                let wp = LowLevelWaypoint::new(now_id, pos);
+                if let Some(c) = constr {
+                    waypoint_stack.push(wp.with_constraints(c));
+                } else {
+                    waypoint_stack.push(wp);
+                }
+                id += 1;
+                return now_id;
             };
+            match node {
+                StatefulMissionItem::Takeoff { altitude } => {
+                    let current_wp = Waypoint::LocalOffset(Vector3::new(0.0, 0.0, 0.0));
+                    let takeoff_wp = Waypoint::LocalOffset(Vector3::new(0.0, 0.0, -altitude));
+                    let local_current =
+                        current_wp.materialize(&local_position, global_position.alt.into());
+                    let local_takeoff =
+                        takeoff_wp.materialize(&local_position, global_position.alt.into());
+                    push_wp(local_current, None);
+                    let takeoff_completed_id = push_wp(
+                        local_takeoff,
+                        Some(Constraints3D {
+                            max_acceleration: Vector3::new(0.2, 0.2, 0.2),
+                            ..constraints
+                        }),
+                    );
+                    self.completions.insert(takeoff_completed_id);
+                }
+                StatefulMissionItem::Waypoint(wp) => {
+                    let local = if let Some(lp) = last_wp {
+                        match wp {
+                            Waypoint::LocalOffset(o) => (lp.position() + o).cast().into(),
+                            Waypoint::GlobalFixedHeight { lat, lon, alt } => {
+                                LocalPosition::project(
+                                    &GlobalPosition {
+                                        lat: *lat,
+                                        lon: *lon,
+                                        alt: *alt as f32,
+                                    },
+                                    &local_position,
+                                )
+                                .unwrap()
+                            }
+                            Waypoint::GlobalRelativeHeight {
+                                lat,
+                                lon,
+                                height_diff,
+                            } => {
+                                let mut init = LocalPosition::project(
+                                    &GlobalPosition {
+                                        lat: *lat,
+                                        lon: *lon,
+                                        alt: global_position.alt,
+                                    },
+                                    &local_position,
+                                )
+                                .unwrap();
+                                init.z = (lp.position().z - *height_diff) as f32;
+                                init
+                            }
+                        }
+                    } else {
+                        wp.materialize(&local_position, 0.0)
+                    };
+
+                    let wp_id = push_wp(local, None);
+                    self.completions.insert(wp_id);
+                }
+                StatefulMissionItem::Transition => (),
+                _ => break,
+            }
         }
+
+        if waypoint_stack.len() < 2 {
+            return Ok(());
+        }
+
+        let sim = TrajectorySimulator::new_constrained(waypoint_stack.clone(), constraints)
+            .context("could not create traj c")?;
+
+        self.sim = Some(sim);
+        self.waypoints = waypoint_stack;
+
+        Ok(())
     }
 
-    pub fn get_next_target(&self) -> Option<LocalPosition> {
-        self.splines.get(self.step + 1).map(|s| s.spline.end_pos)
+    pub fn get_current_target(&self) -> Option<&LowLevelWaypoint> {
+        self.waypoints.get(self.step)
+    }
+
+    pub fn get_next_target(&self) -> Option<&LowLevelWaypoint> {
+        self.waypoints.get(self.step + 1)
+    }
+
+    pub fn pause(&mut self, node: &Node) {
+        self.sim.as_mut().map(|s| {
+            s.pause(node);
+            self.manual_pause = true
+        });
+    }
+
+    pub fn resume(&mut self) {
+        self.sim.as_mut().map(|s| {
+            s.resume();
+            self.manual_pause = false
+        });
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.sim.as_ref().is_some_and(|s| s.is_paused())
     }
 }
 
-pub struct TimedSpline {
-    spline: Spline,
-    start_time: f64,
-    end_time: f64,
+pub struct TrajectoryPoll {
+    pub snapshot: StateSnapshot,
+    pub current_target: LowLevelWaypoint,
+    pub status: WaypointStatus,
 }
 
-pub struct TrajectoryOutput {
-    pub snapshot: TrajectorySnapshot,
-    pub progress: TrajectoryProgress,
-    pub current_target: LocalPosition,
+pub enum WaypointStatus {
+    NoProgress,
+    Progress,
+    Finish,
 }
 
-pub enum TrajectoryProgress {
-    Started(LocalPosition),
-    InTransit {
-        from: LocalPosition,
-        to: LocalPosition,
-    },
-    Passed(LocalPosition),
-    Clamped(LocalPosition),
+impl WaypointStatus {
+    pub fn is_progress(&self) -> bool {
+        matches!(self, WaypointStatus::Progress | WaypointStatus::Finish)
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct TrajectorySnapshot {
+pub struct StateSnapshot {
     pub position: Vector3<f64>,
     pub velocity: Vector3<f64>,
     pub acceleration: Vector3<f64>,
@@ -213,13 +286,15 @@ pub struct TrajectorySnapshot {
 
 #[derive(Debug, Clone)]
 pub struct LowLevelWaypoint {
-    position: Vector3<f64>,
-    constraints_to: Option<Constraints3D>,
+    pub id: usize,
+    pub position: LocalPosition,
+    pub constraints_to: Option<Constraints3D>,
 }
 
 impl LowLevelWaypoint {
-    pub fn new(position: Vector3<f64>) -> Self {
+    pub fn new(id: usize, position: LocalPosition) -> Self {
         Self {
+            id,
             position,
             constraints_to: None,
         }
@@ -233,6 +308,6 @@ impl LowLevelWaypoint {
     }
 
     pub fn position(&self) -> Vector3<f64> {
-        self.position
+        self.position.to_nalgebra().cast()
     }
 }

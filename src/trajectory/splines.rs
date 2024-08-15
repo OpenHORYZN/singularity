@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 
-use argus_common::LocalPosition;
 use itertools::Itertools;
 use nalgebra::Vector3;
 use s_curve::{
@@ -8,45 +7,35 @@ use s_curve::{
     SCurveStartConditions,
 };
 
-use crate::util::{finite, windows_mut};
+use crate::util::finite;
 
 use super::LowLevelWaypoint;
 
-pub fn s_curve_spline(
-    waypoints: Vec<LowLevelWaypoint>,
-    constraints: Constraints3D,
-    trans_vel: f64,
-) -> Vec<Spline> {
-    let mut path = waypoints
+pub fn s_curve_spline(waypoints: Vec<LowLevelWaypoint>, constraints: Constraints3D) -> Vec<Spline> {
+    let path = waypoints
         .windows(2)
         .map(|w| {
             let (primary, secondary) = (&w[0], &w[1]);
 
             (
                 StartConditions3D {
-                    start_pos: primary.position,
-                    end_pos: secondary.position,
+                    start_pos: primary.position.to_nalgebra().cast(),
+                    end_pos: secondary.position.to_nalgebra().cast(),
                     start_vel: Vector3::zeros(),
                     end_vel: Vector3::zeros(),
                 },
                 secondary.constraints_to.clone(),
+                primary,
+                secondary,
             )
         })
         .collect_vec();
 
-    windows_mut(&mut path, 2, |slices| {
-        let vector_a = slices[0].0.end_pos - slices[0].0.start_pos;
-        let vector_b = slices[1].0.end_pos - slices[1].0.start_pos;
-        let trans_vel_v = ((vector_a.normalize() + vector_b.normalize()) / 2.0) * trans_vel;
-        slices[0].0.end_vel = trans_vel_v;
-        slices[1].0.start_vel = trans_vel_v;
-    });
-
     let spline = path
         .into_iter()
         .map(|sc| {
-            let start_pos = sc.0.start_pos.cast().into();
-            let end_pos = sc.0.end_pos.cast().into();
+            let start_pos = sc.2.clone();
+            let end_pos = sc.3.clone();
             let spline = SCurve3D::init(sc.0, sc.1.unwrap_or(constraints));
             Spline {
                 start_pos,
@@ -60,8 +49,8 @@ pub fn s_curve_spline(
 }
 
 pub struct Spline {
-    pub start_pos: LocalPosition,
-    pub end_pos: LocalPosition,
+    pub start_pos: LowLevelWaypoint,
+    pub end_pos: LowLevelWaypoint,
     pub curve: SCurve3D,
 }
 
