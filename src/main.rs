@@ -79,11 +79,6 @@ async fn main() -> anyhow::Result<()> {
         info!("Received initial Position Frame: {initial_local} {initial_global}");
         info!("Node initialized, Ready for GCS connection");
 
-        let publish_setpoint = |sp: SetpointPair| {
-            publishers.offboard.send(sp.0);
-            publishers.trajectory.send(sp.1);
-        };
-
         let default_constraints = Constraints3D {
             max_velocity: Vector3::new(6.0, 6.0, 6.0),
             max_acceleration: Vector3::repeat(0.4),
@@ -122,8 +117,9 @@ async fn main() -> anyhow::Result<()> {
                         setpoint,
                         do_land,
                     } => {
-                        if let Some(sp) = setpoint {
-                            publish_setpoint(sp);
+                        if let Some((spo, spt)) = setpoint {
+                            publishers.offboard.send(spo);
+                            publishers.trajectory.send(spt);
                         }
                         if do_land {
                             publishers.send_command(&node, PublisherCommand::Land);

@@ -25,6 +25,7 @@ pub struct TrajectoryController {
     waypoints: Vec<LowLevelWaypoint>,
     step: usize,
     manual_pause: bool,
+    rotate_first: bool,
 }
 
 impl TrajectoryController {
@@ -35,6 +36,7 @@ impl TrajectoryController {
             waypoints: vec![],
             step: 0,
             manual_pause: false,
+            rotate_first: false,
         }
     }
 
@@ -50,6 +52,12 @@ impl TrajectoryController {
             snapshot: desired,
             status,
         } = sim.get_state(node);
+
+        if self.rotate_first {
+            sim.pause(node);
+            debug!("Waiting until Yaw is headed to next Waypoint ...");
+            self.rotate_first = false;
+        }
 
         let status = match status {
             SimulatorStatus::Passed(id) => {
@@ -136,6 +144,7 @@ impl TrajectoryController {
         let mut id = 0;
 
         self.completions.clear();
+        self.rotate_first = include_current_pos;
         self.step = 0;
 
         if include_current_pos {

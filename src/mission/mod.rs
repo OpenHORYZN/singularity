@@ -199,15 +199,15 @@ impl MissionPlanner {
             } => {
                 let now = node.timestamp() as f64 / 1e6;
                 let duration = duration.as_secs_f64();
-                if start_time.is_none() {
+                start_time.get_or_insert_with(|| {
                     log_step(&format!("(I) Delay: Waiting for {:.02}s", duration));
-
-                    *start_time = Some(now);
-                }
+                    now
+                });
 
                 let gen_in = match self.trajectory.poll(node, current_state, current_yaw) {
                     Some(poll) => {
                         let TrajectoryPoll { snapshot, .. } = poll;
+
                         GeneratorInput::PosVelAcc {
                             snapshot,
                             yaw: f32::NAN,
