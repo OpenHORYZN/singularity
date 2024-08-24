@@ -44,8 +44,8 @@ impl TrajectorySimulator {
         })
     }
 
-    pub fn get_state(&mut self, node: &Node) -> SimulatorOutput {
-        let now = node.timestamp() as f64 / 1e6;
+    pub fn get_state(&mut self, node: &Node, shift: Option<f64>) -> SimulatorOutput {
+        let now = (node.timestamp() as f64 / 1e6) + shift.unwrap_or_default();
         let mut just_started = false;
         let mut start_time = *self.start_time.get_or_insert_with(|| {
             just_started = true;

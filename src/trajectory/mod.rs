@@ -3,7 +3,9 @@ use std::{collections::HashSet, fmt::Debug};
 
 use anyhow::Context;
 use argus_common::{GlobalPosition, LocalPosition, Waypoint};
+use itertools::Itertools;
 use nalgebra::Vector3;
+use optimization_engine::alm::AlmCache;
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
 use rclrs::Node;
 use tracing::{debug, error};
@@ -26,6 +28,7 @@ pub struct TrajectoryController {
     step: usize,
     manual_pause: bool,
     rotate_first: bool,
+    cache: AlmCache,
 }
 
 impl TrajectoryController {
@@ -37,6 +40,7 @@ impl TrajectoryController {
             step: 0,
             manual_pause: false,
             rotate_first: false,
+            cache: navigation::initialize_solver(),
         }
     }
 
@@ -51,7 +55,7 @@ impl TrajectoryController {
         let SimulatorOutput {
             snapshot: desired,
             status,
-        } = sim.get_state(node);
+        } = sim.get_state(node, None);
 
         if self.rotate_first {
             sim.pause(node);
@@ -104,6 +108,51 @@ impl TrajectoryController {
                 debug!("Yaw rotation complete, resuming");
                 sim.resume();
             }
+        }
+
+        let StateSnapshot {
+            position,
+            velocity,
+            acceleration,
+        } = current_state;
+
+        let p = [
+            velocity.x,
+            velocity.y,
+            velocity.z,
+            acceleration.x,
+            acceleration.y,
+            acceleration.z,
+            position.x,
+            position.y,
+            position.z,
+        ]
+        .into_iter()
+        .chain(
+            (0..30)
+                .map(|i| i as f64 * 0.1)
+                .map(|t| sim.get_state(node, Some(t)).snapshot.position)
+                .map(|p| [p.x, p.y, p.z])
+                .flatten(),
+        )
+        .collect_vec();
+
+        let mut u: Vec<f64> = (0..30)
+            .map(|_| [velocity.x, velocity.y, velocity.z])
+            .chain((0..30).map(|_| [acceleration.x, acceleration.y, acceleration.z]))
+            .flatten()
+            .collect();
+
+        let res = navigation::solve(&p, &mut self.cache, &mut u, &None, &None);
+
+        match res {
+            Ok(s) => {
+                for chunk in u[0..90].chunks_exact(3) {
+                    println!("{chunk:?}");
+                }
+                println!(" ----- ");
+            }
+            Err(e) => println!("Error {e:?}"),
         }
 
         let error_velocity = desired.velocity - current_state.velocity;
