@@ -2,7 +2,7 @@ use std::{fmt::Debug, ops::Sub};
 
 use argus_common::{GlobalPosition, LocalPosition, Waypoint};
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
-use px4_msgs::msg::{VehicleAttitude, VehicleGlobalPosition, VehicleLocalPosition};
+use px4_msgs::msg::{VehicleAttitude, VehicleGlobalPosition, VehicleLocalPosition, VehicleStatus};
 use thiserror::Error;
 use tracing::debug;
 
@@ -161,6 +161,36 @@ impl VehicleLocalFeatures for VehicleLocalPosition {
     fn velocity(&self) -> Vector3<f64> {
         Vector3::new(self.vx, self.vy, self.vz).cast()
     }
+}
+
+pub trait VehicleStatusFeatures {
+    fn vtol_mode(&self) -> VtolMode;
+}
+
+impl VehicleStatusFeatures for VehicleStatus {
+    fn vtol_mode(&self) -> VtolMode {
+        if self.is_vtol {
+            if !self.in_transition_mode && self.vehicle_type == 1 {
+                VtolMode::Multicopter
+            } else if !self.in_transition_mode {
+                VtolMode::FixedWing
+            } else if self.in_transition_mode && self.in_transition_to_fw {
+                VtolMode::TransitionToFW
+            } else {
+                VtolMode::TransitionToMC
+            }
+        } else {
+            VtolMode::Multicopter
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub enum VtolMode {
+    Multicopter,
+    FixedWing,
+    TransitionToMC,
+    TransitionToFW,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]

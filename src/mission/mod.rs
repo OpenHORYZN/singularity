@@ -21,7 +21,7 @@ use crate::{
     },
     util::{
         attitude_to_yaw, default, ApproxEq, LocalPositionFeatures, NodeTimestamp,
-        VehicleLocalFeatures, XYZTolerance,
+        VehicleLocalFeatures, VehicleStatusFeatures, VtolMode, XYZTolerance,
     },
 };
 
@@ -130,7 +130,7 @@ impl MissionPlanner {
         let setpoint = match current {
             StatefulMissionItem::Init => MissionSnapshot::Step {
                 step: current_step,
-                setpoint: self.generate_setpoint(node, GeneratorInput::VelocityZero),
+                setpoint: self.generate_setpoint(node, GeneratorInput::VelocityZero, subscribers),
                 do_land: false,
             },
 
@@ -157,8 +157,11 @@ impl MissionPlanner {
 
                 MissionSnapshot::Step {
                     step: current_step,
-                    setpoint: self
-                        .generate_setpoint(node, GeneratorInput::PosVelAcc { snapshot, yaw }),
+                    setpoint: self.generate_setpoint(
+                        node,
+                        GeneratorInput::PosVelAcc { snapshot, yaw },
+                        subscribers,
+                    ),
                     do_land: false,
                 }
             }
@@ -188,8 +191,11 @@ impl MissionPlanner {
 
                 MissionSnapshot::Step {
                     step: current_step,
-                    setpoint: self
-                        .generate_setpoint(node, GeneratorInput::PosVelAcc { snapshot, yaw }),
+                    setpoint: self.generate_setpoint(
+                        node,
+                        GeneratorInput::PosVelAcc { snapshot, yaw },
+                        subscribers,
+                    ),
                     do_land: false,
                 }
             }
@@ -218,7 +224,7 @@ impl MissionPlanner {
 
                 MissionSnapshot::Step {
                     step: current_step,
-                    setpoint: self.generate_setpoint(node, gen_in),
+                    setpoint: self.generate_setpoint(node, gen_in, subscribers),
                     do_land: false,
                 }
             }
@@ -374,7 +380,12 @@ impl MissionPlanner {
         }
     }
 
-    pub fn generate_setpoint(&self, node: &Node, input: GeneratorInput) -> Option<SetpointPair> {
+    pub fn generate_setpoint(
+        &self,
+        node: &Node,
+        input: GeneratorInput,
+        subscribers: &Subscribers,
+    ) -> Option<SetpointPair> {
         match input {
             GeneratorInput::PosVelAcc { snapshot, yaw } => {
                 let StateSnapshot {
@@ -383,13 +394,17 @@ impl MissionPlanner {
                     acceleration: final_acc,
                 } = snapshot;
 
-                let is_running = !self.trajectory.is_paused();
+                let enable_full = !self.trajectory.is_paused()
+                    && matches!(
+                        subscribers.vehicle_status.current().vtol_mode(),
+                        VtolMode::Multicopter
+                    );
 
                 let offb = OffboardControlMode {
                     timestamp: node.timestamp(),
                     position: true,
-                    velocity: is_running,
-                    acceleration: is_running,
+                    velocity: enable_full,
+                    acceleration: enable_full,
                     ..default()
                 };
 

@@ -18,7 +18,7 @@ pub mod util;
 
 use crate::{
     link::ArgusLink,
-    mission::{MissionPlanner, MissionSnapshot, SetpointPair},
+    mission::{MissionPlanner, MissionSnapshot},
     topics::{PublisherCommand, Publishers, Subscribers},
     trajectory::Constraints3D,
     util::GlobalPositionFeatures,
