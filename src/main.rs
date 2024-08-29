@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use nalgebra::Vector3;
 use rclrs::MandatoryParameter;
 use std::sync::{mpsc, Arc};
 use tokio::{sync::watch, task::spawn_blocking};
@@ -8,7 +7,7 @@ use util::LocalPositionFeatures;
 
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
 
-use argus_common::{ControlRequest, ControlResponse, GlobalPosition, LocalPosition};
+use argus_common::{ControlRequest, ControlResponse, GlobalPosition, LocalPosition, MissionParams};
 
 pub mod link;
 pub mod mission;
@@ -79,12 +78,6 @@ async fn main() -> anyhow::Result<()> {
         info!("Received initial Position Frame: {initial_local} {initial_global}");
         info!("Node initialized, Ready for GCS connection");
 
-        let default_constraints = Constraints3D {
-            max_velocity: Vector3::new(6.0, 6.0, 6.0),
-            max_acceleration: Vector3::repeat(0.4),
-            max_jerk: Vector3::repeat(0.4),
-        };
-
         loop {
             let _ = step_in.send(-1);
             info!("Waiting for Mission ...");
@@ -95,6 +88,19 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 rclrs::spin_once(node.clone(), None)?;
+            };
+
+            let MissionParams {
+                target_velocity,
+                target_acceleration,
+                target_jerk,
+                ..
+            } = mission.params;
+
+            let default_constraints = Constraints3D {
+                max_velocity: target_velocity,
+                max_acceleration: target_acceleration,
+                max_jerk: target_jerk,
             };
 
             let home_position_global = subscribers.global_position.current().to_owned();
