@@ -7,21 +7,21 @@ use std::{
 };
 
 use anyhow::{anyhow, bail};
-use futures_util::SinkExt;
+use nalgebra::Vector3;
 use postcard::from_bytes;
 use tokio::{select, sync::watch, time::sleep};
 use tracing::{error, info};
 use zenoh::{
-    config::{AclConfigRules, Action, InterceptorFlow, Permission},
-    prelude::r#async::*,
-    publication::Publisher,
-    subscriber::FlumeSubscriber,
+    config::{self, EndPoint},
+    prelude::*,
+    pubsub::{FlumeSubscriber, Publisher},
+    Session,
 };
 
 use argus_common::{
     interface::{
         IControlRequest, IControlResponse, IGlobalPosition, ILocalPosition, IMissionStep,
-        IMissionUpdate, IYaw, Interface,
+        IMissionUpdate, IVelocity, IYaw, Interface,
     },
     ControlRequest, ControlResponse, GlobalPosition, LocalPosition, MissionPlan,
 };
@@ -50,18 +50,22 @@ impl ArgusLink {
             let m = machine;
             let mut config = config::default();
 
-            Self::set_acl(&mut config)?;
-
             let interface = "tailscale0";
 
-            config.listen.endpoints = vec![
-                EndPoint::new("udp", "0.0.0.0:0", "", format!("iface={interface}"))?,
-                EndPoint::new("tcp", "0.0.0.0:0", "", format!("iface={interface}"))?,
-            ];
+            config
+                .listen
+                .endpoints
+                .set(vec![EndPoint::new(
+                    "udp",
+                    "0.0.0.0:0",
+                    "",
+                    format!("iface={interface}"),
+                )?])
+                .emap()?;
 
-            config.transport.unicast.set_max_links(10).emap()?;
+            config.transport.unicast.set_max_links(1).emap()?;
 
-            let session = Arc::new(zenoh::open(config).res().await?);
+            let session = Arc::new(zenoh::open(config).await?);
 
             let zid = session.zid();
 
@@ -72,8 +76,9 @@ impl ArgusLink {
             let global_pos_pub: Pub<IGlobalPosition> = session.publisher(&m).await?;
             let local_pos_pub: Pub<ILocalPosition> = session.publisher(&m).await?;
             let yaw_pub: Pub<IYaw> = session.publisher(&m).await?;
+            let velocity_pub: Pub<IVelocity> = session.publisher(&m).await?;
             let step_pub: Pub<IMissionStep> = session.publisher(&m).await?;
-            let mut control_pub: Pub<IControlResponse> = session.publisher(&m).await?;
+            let control_pub: Pub<IControlResponse> = session.publisher(&m).await?;
 
             let mission_sub: Sub<IMissionUpdate> = session.subscriber(&m).await?;
             let control_sub: Sub<IControlRequest> = session.subscriber(&m).await?;
@@ -90,6 +95,12 @@ impl ArgusLink {
             Self::bridge(attitude, yaw_pub, |a| attitude_to_yaw(&a));
 
             Self::bridge(step_out, step_pub, identity);
+
+            let local_pos = subs.local_position.subscribe();
+
+            Self::bridge(local_pos, velocity_pub, |p| {
+                Vector3::new(p.vx.into(), p.vy.into(), p.vz.into())
+            });
 
             loop {
                 select! {
@@ -111,7 +122,7 @@ impl ArgusLink {
                     },
                     Some(msg) = control_link.1.recv() => {
                         let data = postcard::to_allocvec(&msg).unwrap();
-                        if let Err(e) = control_pub.publisher.send(data).await {
+                        if let Err(e) = control_pub.publisher.put(data).await {
                             error!("{e}")
                         }
                     }
@@ -124,32 +135,7 @@ impl ArgusLink {
         ArgusLink
     }
 
-    fn set_acl(config: &mut Config) -> Result<(), anyhow::Error> {
-        let all_actions = [
-            Action::Put,
-            Action::DeclareSubscriber,
-            Action::Get,
-            Action::DeclareQueryable,
-        ];
-        config
-            .access_control
-            .set_default_permission(Permission::Deny)
-            .emap()?;
-        config
-            .access_control
-            .set_rules(Some(vec![AclConfigRules {
-                interfaces: Some(vec!["tailscale0".into(), "lo".into()]),
-                actions: all_actions.to_vec(),
-                key_exprs: vec!["**".into()],
-                flows: Some(vec![InterceptorFlow::Ingress, InterceptorFlow::Egress]),
-                permission: Permission::Allow,
-            }]))
-            .emap()?;
-        config.access_control.set_enabled(true).emap()?;
-        Ok(())
-    }
-
-    fn bridge<I, U, F>(mut rcv: watch::Receiver<U>, mut publisher: Pub<I>, mut map: F)
+    fn bridge<I, U, F>(mut rcv: watch::Receiver<U>, publisher: Pub<I>, mut map: F)
     where
         I: Interface,
         I::Message: Clone + Send + Sync + 'static,
@@ -161,7 +147,7 @@ impl ArgusLink {
                 if let Ok(_) = rcv.changed().await {
                     let update = map(rcv.borrow().to_owned());
                     let data = postcard::to_allocvec(&update).unwrap();
-                    if let Err(e) = publisher.publisher.send(data).await {
+                    if let Err(e) = publisher.publisher.put(data).await {
                         error!("{e}")
                     }
                 }
@@ -185,7 +171,7 @@ impl<I: Interface> Sub<I> {
     pub async fn pull(&self) -> anyhow::Result<I::Message> {
         let msg = self.subscriber.recv_async().await;
         match msg {
-            Ok(msg) => match from_bytes(&msg.value.payload.contiguous()) {
+            Ok(msg) => match from_bytes(&Vec::from(msg.payload())) {
                 Ok(msg_c) => return Ok(msg_c),
                 Err(e) => {
                     bail!("Failed to deserialize {e}");
@@ -205,7 +191,6 @@ impl MakeInterface for Arc<Session> {
     async fn publisher<I: Interface>(&self, m: &str) -> anyhow::Result<Pub<I>> {
         let res = self
             .declare_publisher(format!("{m}/{}", I::topic()))
-            .res()
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
         Ok(Pub {
@@ -217,7 +202,6 @@ impl MakeInterface for Arc<Session> {
         let sub = self
             .declare_subscriber(format!("{m}/{}", I::topic()))
             .reliable()
-            .res()
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
 
