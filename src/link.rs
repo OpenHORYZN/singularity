@@ -13,7 +13,6 @@ use tokio::{select, sync::watch, time::sleep};
 use tracing::{error, info};
 use zenoh::{
     config::{self, EndPoint},
-    prelude::*,
     pubsub::{FlumeSubscriber, Publisher},
     Session,
 };
@@ -48,7 +47,7 @@ impl ArgusLink {
     ) -> Self {
         tokio::spawn(async move {
             let m = machine;
-            let mut config = config::default();
+            let mut config = config::Config::default();
 
             let interface = "tailscale0";
 
@@ -163,7 +162,7 @@ pub struct Pub<I> {
 }
 
 pub struct Sub<I> {
-    subscriber: FlumeSubscriber<'static>,
+    subscriber: FlumeSubscriber,
     _phantom: PhantomData<I>,
 }
 
@@ -201,7 +200,6 @@ impl MakeInterface for Arc<Session> {
     async fn subscriber<I: Interface>(&self, m: &str) -> anyhow::Result<Sub<I>> {
         let sub = self
             .declare_subscriber(format!("{m}/{}", I::topic()))
-            .reliable()
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
 
