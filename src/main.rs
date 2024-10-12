@@ -1,7 +1,10 @@
 use anyhow::anyhow;
 use rclrs::MandatoryParameter;
-use std::sync::{mpsc, Arc};
-use tokio::{sync::watch, task::spawn_blocking};
+use std::sync::Arc;
+use tokio::{
+    sync::{mpsc, watch},
+    task::spawn_blocking,
+};
 use tracing::{info, level_filters::LevelFilter};
 use util::LocalPositionFeatures;
 
@@ -46,11 +49,11 @@ async fn main() -> anyhow::Result<()> {
     let subscribers = Subscribers::init(&node)?;
     let publishers = Publishers::init(&node)?;
 
-    let (mission_in, mission_out) = mpsc::channel();
+    let (mission_in, mut mission_out) = mpsc::channel(16);
     let (step_in, step_out) = watch::channel(0);
 
-    let (control_snd_in, control_snd_out) = tokio::sync::mpsc::channel(16);
-    let (control_rcv_in, control_rcv_out) = mpsc::channel();
+    let (control_snd_in, control_snd_out) = mpsc::channel(16);
+    let (control_rcv_in, mut control_rcv_out) = mpsc::channel(16);
 
     ArgusLink::init(
         subscribers.clone(),

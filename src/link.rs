@@ -1,19 +1,17 @@
-use std::{
-    convert::identity,
-    error::Error,
-    marker::PhantomData,
-    sync::{mpsc, Arc},
-    time::Duration,
-};
+use std::{convert::identity, error::Error, marker::PhantomData, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, Context};
 use nalgebra::Vector3;
 use postcard::from_bytes;
-use tokio::{select, sync::watch, time::sleep};
+use tokio::{
+    select,
+    sync::{mpsc, watch},
+    time::sleep,
+};
 use tracing::{error, info};
 use zenoh::{
     config::{self, EndPoint},
-    pubsub::{FlumeSubscriber, Publisher},
+    pubsub::Publisher,
     Session,
 };
 
@@ -41,7 +39,7 @@ impl ArgusLink {
         step_out: watch::Receiver<i32>,
         mut control_link: (
             mpsc::Sender<ControlRequest>,
-            tokio::sync::mpsc::Receiver<ControlResponse>,
+            mpsc::Receiver<ControlResponse>,
         ),
         machine: String,
     ) -> Self {
@@ -79,8 +77,8 @@ impl ArgusLink {
             let step_pub: Pub<IMissionStep> = session.publisher(&m).await?;
             let control_pub: Pub<IControlResponse> = session.publisher(&m).await?;
 
-            let mission_sub: Sub<IMissionUpdate> = session.subscriber(&m).await?;
-            let control_sub: Sub<IControlRequest> = session.subscriber(&m).await?;
+            let mut mission_sub: Sub<IMissionUpdate> = session.subscriber(&m).await?;
+            let mut control_sub: Sub<IControlRequest> = session.subscriber(&m).await?;
 
             let global_pos = subs.global_position.subscribe();
             let local_pos = subs.local_position.subscribe();
@@ -106,7 +104,7 @@ impl ArgusLink {
                     mission = mission_sub.pull() => {
                         match mission {
                             Ok(mission) => {
-                                mission_in.send(mission).unwrap();
+                                mission_in.send(mission).await.unwrap();
                             },
                             Err(e) => println!("{e}"),
                         }
@@ -128,7 +126,7 @@ impl ArgusLink {
                 }
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
-            #[allow(unreachable_code)]
+            #[expect(unreachable_code)]
             Ok::<_, ZenohError>(())
         });
         ArgusLink
@@ -161,29 +159,24 @@ pub struct Pub<I> {
     _phantom: PhantomData<I>,
 }
 
-pub struct Sub<I> {
-    subscriber: FlumeSubscriber,
+pub struct Sub<I: Interface> {
+    tunnel: mpsc::Receiver<I::Message>,
     _phantom: PhantomData<I>,
 }
 
 impl<I: Interface> Sub<I> {
-    pub async fn pull(&self) -> anyhow::Result<I::Message> {
-        let msg = self.subscriber.recv_async().await;
-        match msg {
-            Ok(msg) => match from_bytes(&Vec::from(msg.payload())) {
-                Ok(msg_c) => return Ok(msg_c),
-                Err(e) => {
-                    bail!("Failed to deserialize {e}");
-                }
-            },
-            Err(e) => bail!("{e}"),
-        };
+    pub async fn pull(&mut self) -> anyhow::Result<I::Message> {
+        let msg = self.tunnel.recv().await.context("no more messages")?;
+        Ok(msg)
     }
 }
 
 trait MakeInterface {
     async fn publisher<I: Interface>(&self, m: &str) -> anyhow::Result<Pub<I>>;
-    async fn subscriber<I: Interface>(&self, m: &str) -> anyhow::Result<Sub<I>>;
+    async fn subscriber<I>(&self, m: &str) -> anyhow::Result<Sub<I>>
+    where
+        I: Interface,
+        I::Message: Send + Sync + 'static;
 }
 
 impl MakeInterface for Arc<Session> {
@@ -197,14 +190,32 @@ impl MakeInterface for Arc<Session> {
             _phantom: PhantomData,
         })
     }
-    async fn subscriber<I: Interface>(&self, m: &str) -> anyhow::Result<Sub<I>> {
-        let sub = self
-            .declare_subscriber(format!("{m}/{}", I::topic()))
+    async fn subscriber<I>(&self, m: &str) -> anyhow::Result<Sub<I>>
+    where
+        I: Interface,
+        I::Message: Send + Sync + 'static,
+    {
+        let (tunnel_tx, tunnel_rx) = mpsc::channel(16);
+
+        self.declare_subscriber(format!("{m}/{}", I::topic()))
+            .callback(move |sample| {
+                let can_fail = || {
+                    let payload = sample.payload().to_bytes();
+                    let decoded =
+                        from_bytes::<I::Message>(&payload).context("failed to deserialize")?;
+                    tunnel_tx.try_send(decoded)?;
+                    anyhow::Ok(())
+                };
+                if let Err(e) = can_fail() {
+                    error!("{e}");
+                }
+            })
+            .background()
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
 
         Ok(Sub {
-            subscriber: sub,
+            tunnel: tunnel_rx,
             _phantom: PhantomData,
         })
     }
