@@ -52,12 +52,7 @@ impl ArgusLink {
             config
                 .listen
                 .endpoints
-                .set(vec![EndPoint::new(
-                    "udp",
-                    "0.0.0.0:0",
-                    "",
-                    format!("iface={interface}"),
-                )?])
+                .set(vec![EndPoint::new("tcp", "0.0.0.0:0", "", "")?])
                 .emap()?;
 
             config.transport.unicast.set_max_links(1).emap()?;
