@@ -5,7 +5,7 @@ use tokio::{
     sync::{mpsc, watch},
     task::spawn_blocking,
 };
-use tracing::{info, level_filters::LevelFilter};
+use tracing::info;
 use util::LocalPositionFeatures;
 
 use px4_msgs::msg::{VehicleGlobalPosition, VehicleLocalPosition};
@@ -29,8 +29,7 @@ use crate::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        // .with_env_filter("singularity=debug")
-        .with_max_level(LevelFilter::DEBUG)
+        .with_env_filter("singularity=debug")
         .init();
 
     let context = rclrs::Context::new(std::env::args())?;
